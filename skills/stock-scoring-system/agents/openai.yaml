@@ -1,0 +1,4 @@
+interface:
+  display_name: "Stock Scoring System"
+  short_description: "Design multi-signal stock ranking models"
+  default_prompt: "Use $stock-scoring-system to design or refine a stock scoring model for a target market."
