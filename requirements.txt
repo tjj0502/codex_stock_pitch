@@ -1,0 +1,20 @@
+# Core notebook environment
+jupyterlab
+notebook
+ipykernel
+
+# Data stack
+pandas
+numpy
+matplotlib
+plotly
+requests
+beautifulsoup4
+lxml
+
+# China market data
+tushare
+
+# Technical analysis
+ta
+mplfinance
