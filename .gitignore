@@ -98,3 +98,4 @@ db.sqlite3-journal
 # Misc
 .python-version
 cython_debug/
+Dataframes/
