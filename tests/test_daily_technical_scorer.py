@@ -267,6 +267,26 @@ class DailyTechnicalScorerTest(unittest.TestCase):
         prior_top = scorer.get_top_candidates(2, as_of_date=prior_date)
         self.assertEqual(prior_top["date"].iat[0], prior_date)
 
+    def test_get_top_candidates_can_skip_the_top_quantile_before_selection(self) -> None:
+        dates = pd.date_range("2025-01-01", periods=70, freq="B")
+        strong_closes = np.linspace(20.0, 40.0, len(dates))
+        weak_closes = 28.0 + np.sin(np.arange(len(dates)) * 0.8) * 3.0 + np.linspace(0.0, -7.0, len(dates))
+
+        scorer = DailyTechnicalScorer(
+            pd.concat(
+                [
+                    make_stock_frame("BBB", weak_closes, dates=dates),
+                    make_stock_frame("AAA", strong_closes, dates=dates),
+                    make_stock_frame("AAC", strong_closes, dates=dates),
+                ],
+                ignore_index=True,
+            )
+        )
+        scorer.add_technical_score(top_n=2)
+
+        filtered_top = scorer.get_top_candidates(1, exclude_top_quantile=0.2)
+        self.assertEqual(filtered_top["ticker"].tolist(), ["AAC"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -89,7 +89,8 @@ def get_csi500_member_prices(
     max_calls_per_minute: int = 195,
 ) -> pd.DataFrame:
     """
-    Fetch daily price data for the latest CSI 500 constituents between two dates.
+    Fetch QFQ-adjusted daily price data for the latest CSI 500 constituents
+    between two dates.
 
     Parameters
     ----------
@@ -103,6 +104,13 @@ def get_csi500_member_prices(
         Delay after each per-ticker request to reduce throttling.
     max_calls_per_minute:
         Soft request cap used to stay under Tushare's rate limit.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Daily OHLCV bars on a QFQ-adjusted basis using the existing
+        scorer/backtester schema. The returned dataframe stores
+        ``price_adjustment='qfq'`` in ``attrs``.
     """
     start_date = _normalize_date(sd)
     end_date = _normalize_date(ed)
@@ -112,7 +120,6 @@ def get_csi500_member_prices(
         end_date=end_date,
     )
     client = _get_tushare_client(token=token)
-    print("!")
 
     frames: list[pd.DataFrame] = []
     failed_tickers: list[str] = []
@@ -122,10 +129,13 @@ def get_csi500_member_prices(
     for _, row in constituents.iterrows():
 
         try:
-            price_df = client.daily(
+            price_df = ts.pro_bar(
+                api=client,
                 ts_code=row["ts_code"],
                 start_date=start_date,
                 end_date=end_date,
+                asset="E",
+                adj="qfq",
             )
             calls_in_window += 1
         except Exception as exc:
@@ -135,10 +145,13 @@ def get_csi500_member_prices(
                 window_started_at = time.monotonic()
                 calls_in_window = 0
                 try:
-                    price_df = client.daily(
+                    price_df = ts.pro_bar(
+                        api=client,
                         ts_code=row["ts_code"],
                         start_date=start_date,
                         end_date=end_date,
+                        asset="E",
+                        adj="qfq",
                     )
                     calls_in_window += 1
                 except Exception:
@@ -196,6 +209,7 @@ def get_csi500_member_prices(
             ]
         )
         empty_df.attrs["failed_tickers"] = failed_tickers
+        empty_df.attrs["price_adjustment"] = "qfq"
         return empty_df
 
     result = pd.concat(frames, ignore_index=True)
@@ -220,6 +234,7 @@ def get_csi500_member_prices(
         ]
     ].sort_values(["date", "ticker"], ignore_index=True)
     result.attrs["failed_tickers"] = failed_tickers
+    result.attrs["price_adjustment"] = "qfq"
     return result
 
 
@@ -547,9 +562,12 @@ class DailyTechnicalScorer:
         self,
         top_n: int,
         as_of_date: str | pd.Timestamp | None = None,
+        exclude_top_quantile: float = 0.0,
     ) -> pd.DataFrame:
         if top_n < 1:
             raise ValueError("top_n must be at least 1.")
+        if exclude_top_quantile < 0 or exclude_top_quantile >= 1:
+            raise ValueError("exclude_top_quantile must be between 0 and 1.")
         if "technical_score" not in self.stock_candle_df.columns:
             self.add_technical_score()
 
@@ -566,6 +584,9 @@ class DailyTechnicalScorer:
             kind="mergesort",
             ignore_index=True,
         )
+        if exclude_top_quantile > 0:
+            excluded_count = int(np.ceil(len(candidates) * exclude_top_quantile))
+            candidates = candidates.iloc[excluded_count:].reset_index(drop=True)
         columns = [
             "date",
             "ticker",
