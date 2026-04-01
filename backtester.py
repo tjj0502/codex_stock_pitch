@@ -12,16 +12,11 @@ from plotly.subplots import make_subplots
 
 @dataclass(frozen=True)
 class ExecutionCostModel:
-    commission_rate: float = 0.0
-    min_commission: float = 0.0
-    stamp_duty_rate: float = 0.0
-    transfer_fee_rate: float = 0.0
-    half_spread_bps: float = 0.0
-    # commission_rate: float = 0.0003
-    # min_commission: float = 5.0
-    # stamp_duty_rate: float = 0.0005
-    # transfer_fee_rate: float = 0.00001
-    # half_spread_bps: float = 5.0
+    commission_rate: float = 0.0003
+    min_commission: float = 5.0
+    stamp_duty_rate: float = 0.0005
+    transfer_fee_rate: float = 0.00001
+    half_spread_bps: float = 5.0
 
 
 class Backtester(ABC):

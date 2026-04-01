@@ -7,7 +7,7 @@ import china_stock_data
 
 
 def make_constituents_frame() -> pd.DataFrame:
-    return pd.DataFrame(
+    frame = pd.DataFrame(
         [
             {
                 "ticker": "BBB",
@@ -25,9 +25,14 @@ def make_constituents_frame() -> pd.DataFrame:
             },
         ]
     )
+    frame.attrs["constituent_trade_date"] = "20250331"
+    return frame
 
 
-def make_price_frame(ts_code: str, rows: list[tuple[str, float, float, float, float, float, float, float]]) -> pd.DataFrame:
+def make_price_frame(
+    ts_code: str,
+    rows: list[tuple[str, float, float, float, float, float, float, float]],
+) -> pd.DataFrame:
     records = []
     for trade_date, open_, high, low, close, pre_close, vol, amount in rows:
         change = close - pre_close
@@ -50,7 +55,7 @@ def make_price_frame(ts_code: str, rows: list[tuple[str, float, float, float, fl
     return pd.DataFrame(records)
 
 
-class GetCsi500MemberPricesTest(unittest.TestCase):
+class IndexDataFetchTest(unittest.TestCase):
     EXPECTED_COLUMNS = [
         "date",
         "ticker",
@@ -70,10 +75,51 @@ class GetCsi500MemberPricesTest(unittest.TestCase):
         "change_amount",
     ]
 
+    @patch("china_stock_data._get_tushare_client")
+    def test_get_index_constituents_returns_latest_snapshot_with_metadata(
+        self,
+        mock_get_client: MagicMock,
+    ) -> None:
+        mock_client = MagicMock()
+        mock_client.index_weight.return_value = pd.DataFrame(
+            [
+                {"trade_date": "20250331", "con_code": "000002.SZ", "weight": 2.0},
+                {"trade_date": "20250331", "con_code": "000001.SZ", "weight": 1.0},
+                {"trade_date": "20250324", "con_code": "000003.SZ", "weight": 3.0},
+            ]
+        )
+        mock_client.stock_basic.return_value = pd.DataFrame(
+            [
+                {"ts_code": "000001.SZ", "name": "AAA Corp"},
+                {"ts_code": "000002.SZ", "name": "BBB Corp"},
+                {"ts_code": "000003.SZ", "name": "CCC Corp"},
+            ]
+        )
+        mock_get_client.return_value = mock_client
+
+        result = china_stock_data.get_index_constituents(
+            "000300.SH",
+            start_date="2025-03-01",
+            end_date="2025-03-31",
+        )
+
+        self.assertEqual(set(result["ticker"]), {"000001", "000002"})
+        self.assertEqual(set(result["name"]), {"AAA Corp", "BBB Corp"})
+        self.assertEqual(result.attrs["index_code"], "000300.SH")
+        self.assertEqual(result.attrs["universe"], "hs300")
+        self.assertEqual(result.attrs["index_label"], "HS300")
+        self.assertEqual(result.attrs["constituent_history_mode"], "latest_snapshot")
+        self.assertEqual(result.attrs["constituent_trade_date"], "20250331")
+        mock_client.index_weight.assert_called_once_with(
+            index_code="000300.SH",
+            start_date="20250301",
+            end_date="20250331",
+        )
+
     @patch("china_stock_data.ts.pro_bar")
     @patch("china_stock_data._get_tushare_client")
-    @patch("china_stock_data.get_csi500_constituents")
-    def test_get_csi500_member_prices_fetches_qfq_adjusted_schema(
+    @patch("china_stock_data.get_index_constituents")
+    def test_get_index_member_prices_fetches_qfq_adjusted_schema_and_metadata(
         self,
         mock_get_constituents: MagicMock,
         mock_get_client: MagicMock,
@@ -99,7 +145,8 @@ class GetCsi500MemberPricesTest(unittest.TestCase):
             ),
         ]
 
-        result = china_stock_data.get_csi500_member_prices(
+        result = china_stock_data.get_index_member_prices(
+            "000905.SH",
             sd="2025-01-02",
             ed="2025-01-03",
             pause_seconds=0.0,
@@ -108,6 +155,11 @@ class GetCsi500MemberPricesTest(unittest.TestCase):
         self.assertEqual(result.columns.tolist(), self.EXPECTED_COLUMNS)
         self.assertEqual(result.attrs["price_adjustment"], "qfq")
         self.assertEqual(result.attrs["failed_tickers"], [])
+        self.assertEqual(result.attrs["index_code"], "000905.SH")
+        self.assertEqual(result.attrs["universe"], "csi500")
+        self.assertEqual(result.attrs["index_label"], "CSI500")
+        self.assertEqual(result.attrs["constituent_history_mode"], "latest_snapshot")
+        self.assertEqual(result.attrs["constituent_trade_date"], "20250331")
         self.assertEqual(
             list(zip(result["date"].dt.strftime("%Y-%m-%d"), result["ticker"])),
             [
@@ -118,7 +170,10 @@ class GetCsi500MemberPricesTest(unittest.TestCase):
             ],
         )
         self.assertAlmostEqual(
-            result.loc[(result["ticker"] == "AAA") & (result["date"] == pd.Timestamp("2025-01-03")), "amplitude_pct"].iat[0],
+            result.loc[
+                (result["ticker"] == "AAA") & (result["date"] == pd.Timestamp("2025-01-03")),
+                "amplitude_pct",
+            ].iat[0],
             (10.6 - 9.8) / 10.1 * 100.0,
         )
         self.assertEqual(
@@ -145,8 +200,8 @@ class GetCsi500MemberPricesTest(unittest.TestCase):
 
     @patch("china_stock_data.ts.pro_bar")
     @patch("china_stock_data._get_tushare_client")
-    @patch("china_stock_data.get_csi500_constituents")
-    def test_get_csi500_member_prices_returns_empty_qfq_frame_when_no_prices(
+    @patch("china_stock_data.get_index_constituents")
+    def test_get_index_member_prices_returns_empty_frame_when_no_prices(
         self,
         mock_get_constituents: MagicMock,
         mock_get_client: MagicMock,
@@ -156,7 +211,8 @@ class GetCsi500MemberPricesTest(unittest.TestCase):
         mock_get_client.return_value = MagicMock()
         mock_pro_bar.return_value = pd.DataFrame()
 
-        result = china_stock_data.get_csi500_member_prices(
+        result = china_stock_data.get_index_member_prices(
+            "000300.SH",
             sd="2025-01-02",
             ed="2025-01-03",
             pause_seconds=0.0,
@@ -166,11 +222,14 @@ class GetCsi500MemberPricesTest(unittest.TestCase):
         self.assertEqual(result.columns.tolist(), self.EXPECTED_COLUMNS)
         self.assertEqual(result.attrs["failed_tickers"], [])
         self.assertEqual(result.attrs["price_adjustment"], "qfq")
+        self.assertEqual(result.attrs["index_code"], "000300.SH")
+        self.assertEqual(result.attrs["universe"], "hs300")
+        self.assertEqual(result.attrs["constituent_history_mode"], "latest_snapshot")
 
     @patch("china_stock_data.ts.pro_bar")
     @patch("china_stock_data._get_tushare_client")
-    @patch("china_stock_data.get_csi500_constituents")
-    def test_get_csi500_member_prices_tracks_failed_tickers_with_qfq_fetches(
+    @patch("china_stock_data.get_index_constituents")
+    def test_get_index_member_prices_tracks_failed_tickers(
         self,
         mock_get_constituents: MagicMock,
         mock_get_client: MagicMock,
@@ -186,7 +245,8 @@ class GetCsi500MemberPricesTest(unittest.TestCase):
             ),
         ]
 
-        result = china_stock_data.get_csi500_member_prices(
+        result = china_stock_data.get_index_member_prices(
+            "000905.SH",
             sd="2025-01-02",
             ed="2025-01-03",
             pause_seconds=0.0,
@@ -195,6 +255,50 @@ class GetCsi500MemberPricesTest(unittest.TestCase):
         self.assertEqual(result["ticker"].tolist(), ["AAA"])
         self.assertEqual(result.attrs["failed_tickers"], ["BBB"])
         self.assertEqual(result.attrs["price_adjustment"], "qfq")
+
+    @patch("china_stock_data.get_index_member_prices")
+    @patch("china_stock_data.get_index_constituents")
+    def test_index_wrappers_delegate_to_generic_helpers(
+        self,
+        mock_get_constituents: MagicMock,
+        mock_get_member_prices: MagicMock,
+    ) -> None:
+        mock_get_constituents.return_value = pd.DataFrame()
+        mock_get_member_prices.return_value = pd.DataFrame()
+
+        china_stock_data.get_csi500_constituents(start_date="2025-03-01", end_date="2025-03-31")
+        china_stock_data.get_hs300_constituents(start_date="2025-03-01", end_date="2025-03-31")
+        china_stock_data.get_csi500_member_prices("2025-01-01", "2025-01-10")
+        china_stock_data.get_hs300_member_prices("2025-01-01", "2025-01-10")
+
+        self.assertEqual(
+            mock_get_constituents.call_args_list,
+            [
+                call("000905.SH", token=None, start_date="2025-03-01", end_date="2025-03-31"),
+                call("000300.SH", token=None, start_date="2025-03-01", end_date="2025-03-31"),
+            ],
+        )
+        self.assertEqual(
+            mock_get_member_prices.call_args_list,
+            [
+                call(
+                    "000905.SH",
+                    sd="2025-01-01",
+                    ed="2025-01-10",
+                    token=None,
+                    pause_seconds=1.3,
+                    max_calls_per_minute=195,
+                ),
+                call(
+                    "000300.SH",
+                    sd="2025-01-01",
+                    ed="2025-01-10",
+                    token=None,
+                    pause_seconds=1.3,
+                    max_calls_per_minute=195,
+                ),
+            ],
+        )
 
 
 if __name__ == "__main__":
