@@ -169,6 +169,43 @@ class BlueChipRangeReversionResearcher:
         "max_favorable_excursion",
         "max_adverse_excursion",
     ]
+    TRADE_COLUMNS = [
+        "signal_date",
+        "ticker",
+        "ts_code",
+        "name",
+        "weight",
+        "constituent_trade_date",
+        "signal_open",
+        "signal_high",
+        "signal_low",
+        "signal_close",
+        "range_upper",
+        "range_lower",
+        "range_mid",
+        "range_amplitude",
+        "zone_position",
+        "expected_upside_to_upper",
+        "ret_60d",
+        "ma_dispersion",
+        "lower_touch_count",
+        "upper_touch_count",
+        "rebound_confirm_count",
+        "entry_date",
+        "entry_open",
+        "signal_take_profit_price",
+        "signal_hard_stop_price",
+        "exit_signal_date",
+        "exit_date",
+        "exit_open",
+        "exit_reason",
+        "trade_status",
+        "holding_days",
+        "pnl",
+        "pnl_pct",
+        "max_favorable_excursion",
+        "max_adverse_excursion",
+    ]
 
     def __init__(
         self,
@@ -188,6 +225,10 @@ class BlueChipRangeReversionResearcher:
         self.stock_candle_df.attrs["constituent_history_mode"] = self.stock_candle_df.attrs.get(
             "constituent_history_mode", "latest_snapshot"
         )
+        self.trade_df = pd.DataFrame(columns=self.TRADE_COLUMNS)
+        # Precompute the full research state once during initialization so
+        # downstream inspection/plotting calls do not repeatedly rebuild it.
+        self.add_research_outcomes()
 
     @classmethod
     def _prepare_input_frame(cls, df: pd.DataFrame) -> pd.DataFrame:
@@ -222,6 +263,47 @@ class BlueChipRangeReversionResearcher:
         updated.attrs.update(dict(self.stock_candle_df.attrs))
         self.stock_candle_df = updated
         return self.stock_candle_df
+
+    def _store_trade_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Persist the latest trade-level dataframe and attach sanity-check metadata."""
+        if df.empty:
+            updated = pd.DataFrame(columns=self.TRADE_COLUMNS)
+        else:
+            updated = df.sort_values(
+                ["entry_date", "ticker", "signal_date"],
+                kind="mergesort",
+                ignore_index=True,
+            )
+            updated = updated.loc[:, [column for column in self.TRADE_COLUMNS if column in updated.columns]]
+
+        updated.attrs.update(dict(self.stock_candle_df.attrs))
+        total_trade_count = int(len(updated))
+        open_trade_mask = updated["trade_status"].eq("open") if "trade_status" in updated.columns else pd.Series(dtype=bool)
+        open_trade_count = int(open_trade_mask.sum()) if total_trade_count else 0
+        updated.attrs["total_trade_count"] = total_trade_count
+        updated.attrs["closed_trade_count"] = total_trade_count - open_trade_count
+        updated.attrs["open_trade_count"] = open_trade_count
+        updated.attrs["all_trades_closed"] = open_trade_count == 0
+        updated.attrs["open_trade_tickers"] = (
+            updated.loc[open_trade_mask, "ticker"].astype(str).tolist() if total_trade_count else []
+        )
+        updated.attrs["sanity_check_message"] = (
+            "All executed buys have matching exits."
+            if open_trade_count == 0
+            else f"{open_trade_count} executed buys are still open at the end of the sample."
+        )
+        self.trade_df = updated
+        return self.trade_df
+
+    def _has_columns(self, columns: list[str]) -> bool:
+        """Check whether the working dataframe already contains all requested columns."""
+        return all(column in self.stock_candle_df.columns for column in columns)
+
+    def _ensure_research_outcomes(self) -> None:
+        """Materialize research outcome columns only when they are missing."""
+        required_columns = self.SIGNAL_COLUMNS + self.OUTCOME_COLUMNS + ["range_candidate"]
+        if not self._has_columns(required_columns):
+            self.add_research_outcomes()
 
     @staticmethod
     def _rolling_return(series: pd.Series, window: int) -> pd.Series:
@@ -502,6 +584,54 @@ class BlueChipRangeReversionResearcher:
 
         return self._store_output(df)
 
+    def add_trade_df(self) -> pd.DataFrame:
+        """
+        Build a trade-level dataframe from executed research signals.
+
+        Each row represents one executed entry signal. Because this researcher
+        does not size positions yet, ``pnl`` is reported on a one-share basis:
+        ``exit_open - entry_open``. Later portfolio/backtest layers can scale
+        that by actual shares.
+
+        The returned dataframe is also stored on ``self.trade_df`` and carries
+        sanity-check metadata in ``trade_df.attrs`` so we can quickly tell
+        whether every executed buy was eventually closed.
+        """
+        # Trade extraction should reflect the latest working dataframe even if
+        # the caller manually adjusted signal-related columns beforehand.
+        self.add_research_outcomes()
+        signal_frame = self._sort_for_calculation(self.stock_candle_df.copy())
+        trades = signal_frame[signal_frame["entry_signal_executed"]].copy()
+
+        if trades.empty:
+            return self._store_trade_df(trades)
+
+        trades["signal_date"] = trades["date"]
+        trades["signal_open"] = trades["open"]
+        trades["signal_high"] = trades["high"]
+        trades["signal_low"] = trades["low"]
+        trades["signal_close"] = trades["close"]
+        trades["entry_date"] = trades["entry_date_next"]
+        trades["entry_open"] = trades["entry_open_next"]
+        trades["exit_date"] = trades["exit_date_next"]
+        trades["exit_open"] = trades["exit_open_next"]
+
+        closed_mask = (
+            trades["exit_reason"].notna()
+            & trades["exit_reason"].ne("open_position")
+            & trades["exit_date"].notna()
+            & trades["exit_open"].gt(0)
+        )
+        trades["trade_status"] = np.where(closed_mask, "closed", "open")
+        trades["pnl_pct"] = trades["realized_open_to_open_return"]
+        trades["pnl"] = np.where(
+            closed_mask & trades["entry_open"].gt(0),
+            trades["exit_open"] - trades["entry_open"],
+            np.nan,
+        )
+
+        return self._store_trade_df(trades)
+
     def get_candidates(self, as_of_date: str | pd.Timestamp | None = None) -> pd.DataFrame:
         """Return all raw candidates on a signal date, sorted by attractiveness."""
         if "entry_signal" not in self.stock_candle_df.columns:
@@ -547,7 +677,7 @@ class BlueChipRangeReversionResearcher:
         lookahead: int = 10,
     ) -> dict[str, pd.DataFrame | dict[str, object]]:
         """
-        Build a structured audit package for one signal.
+        Build a structured audit package for one executed signal.
 
         The returned payload is meant for debugging and strategy review:
         - summary: key timing and outcome fields
@@ -558,7 +688,7 @@ class BlueChipRangeReversionResearcher:
         if lookback < 0 or lookahead < 0:
             raise ValueError("lookback and lookahead must be non-negative.")
 
-        self.add_research_outcomes()
+        self._ensure_research_outcomes()
         target_date = pd.to_datetime(signal_date)
         ticker = str(ticker)
         scored = self._sort_for_calculation(self.stock_candle_df.copy())
@@ -570,17 +700,21 @@ class BlueChipRangeReversionResearcher:
         if signal_rows.empty:
             raise ValueError(f"Ticker '{ticker}' does not have data on {target_date.date()}.")
 
-        signal_row = signal_rows.iloc[[0]].copy().reset_index(drop=True)
+        executed_rows = signal_rows[signal_rows["entry_signal_executed"]]
+        if executed_rows.empty:
+            if bool(signal_rows["entry_signal_suppressed"].fillna(False).any()):
+                raise ValueError(
+                    f"Ticker '{ticker}' on {target_date.date()} was a suppressed signal, not an executed entry."
+                )
+            raise ValueError(
+                f"Ticker '{ticker}' does not have an executed signal on {target_date.date()}."
+            )
+
+        signal_row = executed_rows.iloc[[0]].copy().reset_index(drop=True)
         signal_loc = int(ticker_frame.index[ticker_frame["date"] == target_date][0])
-        exit_date = signal_row["exit_date_next"].iat[0] if "exit_date_next" in signal_row.columns else pd.NaT
-        if pd.notna(exit_date):
-            exit_locs = ticker_frame.index[ticker_frame["date"] == exit_date]
-            event_end_loc = int(exit_locs[0]) if len(exit_locs) else signal_loc
-        else:
-            event_end_loc = min(len(ticker_frame) - 1, signal_loc + lookahead)
 
         start_loc = max(0, signal_loc - lookback)
-        end_loc = min(len(ticker_frame), event_end_loc + lookahead + 1)
+        end_loc = min(len(ticker_frame), signal_loc + lookahead + 1)
         price_window = ticker_frame.iloc[start_loc:end_loc].copy().reset_index(drop=True)
         price_window["signal_marker"] = price_window["date"].eq(target_date)
         price_window["entry_marker"] = price_window["date"].eq(signal_row["entry_date_next"].iat[0])
@@ -735,6 +869,10 @@ class BlueChipRangeReversionResearcher:
 
         entry_date = signal_row["entry_date_next"].iat[0]
         exit_date = signal_row["exit_date_next"].iat[0]
+        exit_signal_date = signal_row["exit_signal_date"].iat[0] if "exit_signal_date" in signal_row.columns else pd.NaT
+        exit_reason = (
+            None if pd.isna(signal_row["exit_reason"].iat[0]) else str(signal_row["exit_reason"].iat[0])
+        )
         figure.add_vline(x=signal_row["date"].iat[0], line_dash="dash", line_color="royalblue", row=1, col=1)
         if pd.notna(entry_date):
             entry_rows = price_window[price_window["date"] == entry_date]
@@ -744,27 +882,78 @@ class BlueChipRangeReversionResearcher:
                     go.Scatter(
                         x=[entry_date],
                         y=[entry_price],
-                        mode="markers",
-                        marker=dict(size=11, symbol="triangle-up", color="green"),
+                        mode="markers+text",
+                        marker=dict(size=14, symbol="triangle-up", color="green"),
+                        text=["Entry"],
+                        textposition="bottom center",
                         name="Entry",
+                        hovertemplate="Entry<br>Date=%{x}<br>Price=%{y:.2f}<extra></extra>",
                     ),
+                    row=1,
+                    col=1,
+                )
+        if pd.notna(exit_signal_date):
+            exit_signal_rows = price_window[price_window["date"] == exit_signal_date]
+            if not exit_signal_rows.empty:
+                figure.add_vline(
+                    x=exit_signal_date,
+                    line_dash="dot",
+                    line_color="indianred",
                     row=1,
                     col=1,
                 )
         if pd.notna(exit_date):
             exit_price = signal_row["exit_open_next"].iat[0] if "exit_open_next" in signal_row.columns else np.nan
-            if pd.notna(exit_price):
+            exit_rows = price_window[price_window["date"] == exit_date]
+            if not exit_rows.empty and pd.notna(exit_price):
                 figure.add_trace(
                     go.Scatter(
                         x=[exit_date],
                         y=[exit_price],
-                        mode="markers",
-                        marker=dict(size=11, symbol="x", color="red"),
-                        name="Exit",
+                        mode="markers+text",
+                        marker=dict(size=16, symbol="x", color="red", line=dict(width=2, color="darkred")),
+                        text=[f"Exit ({exit_reason})" if exit_reason else "Exit"],
+                        textposition="top center",
+                        name=f"Exit ({exit_reason})" if exit_reason else "Exit",
+                        hovertemplate=(
+                            "Exit<br>Date=%{x}<br>Price=%{y:.2f}<br>Reason="
+                            + (exit_reason or "unknown")
+                            + "<extra></extra>"
+                        ),
                     ),
                     row=1,
                     col=1,
                 )
+                figure.add_annotation(
+                    x=exit_date,
+                    y=exit_price,
+                    text=f"Exit<br>{exit_reason}" if exit_reason else "Exit",
+                    showarrow=True,
+                    arrowhead=2,
+                    arrowsize=1,
+                    arrowwidth=1,
+                    arrowcolor="red",
+                    ax=30,
+                    ay=-40,
+                    row=1,
+                    col=1,
+                )
+        elif exit_reason:
+            latest_row = price_window.iloc[-1]
+            figure.add_annotation(
+                x=latest_row["date"],
+                y=latest_row["close"],
+                text=f"Status<br>{exit_reason}",
+                showarrow=True,
+                arrowhead=2,
+                arrowsize=1,
+                arrowwidth=1,
+                arrowcolor="dimgray",
+                ax=30,
+                ay=-40,
+                row=1,
+                col=1,
+            )
 
         figure.add_trace(
             go.Bar(
@@ -793,6 +982,7 @@ class BlueChipRangeReversionResearcher:
             hovermode="x unified",
             title=title,
             xaxis_rangeslider_visible=False,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0),
         )
         figure.update_yaxes(title_text="Price", row=1, col=1)
         figure.update_yaxes(title_text="Met", row=2, col=1, range=[0, 1.2])

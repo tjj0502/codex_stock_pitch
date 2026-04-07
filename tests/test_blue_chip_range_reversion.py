@@ -149,6 +149,7 @@ def make_manual_outcome_researcher() -> BlueChipRangeReversionResearcher:
 
     researcher.stock_candle_df = prepared
     researcher.add_signals = lambda: researcher.stock_candle_df
+    researcher.add_research_outcomes()
     return researcher
 
 
@@ -239,6 +240,72 @@ class BlueChipRangeReversionResearcherTest(unittest.TestCase):
         self.assertTrue(bool(aaa_rows.loc[2, "entry_signal_suppressed"]))
         self.assertFalse(bool(aaa_rows.loc[1, "entry_signal_executed"]))
 
+    def test_add_trade_df_builds_trade_level_output_for_closed_trades(self) -> None:
+        researcher = make_manual_outcome_researcher()
+        trade_df = researcher.add_trade_df()
+
+        self.assertIs(researcher.trade_df, trade_df)
+        self.assertEqual(trade_df["ticker"].tolist(), ["AAA", "BBB", "CCC", "DDD"])
+        self.assertTrue(
+            {
+                "signal_date",
+                "ticker",
+                "name",
+                "entry_date",
+                "exit_date",
+                "exit_reason",
+                "pnl",
+                "pnl_pct",
+                "entry_open",
+                "exit_open",
+                "trade_status",
+            }.issubset(trade_df.columns)
+        )
+        self.assertTrue(trade_df["trade_status"].eq("closed").all())
+        self.assertTrue(trade_df.attrs["all_trades_closed"])
+        self.assertEqual(trade_df.attrs["open_trade_count"], 0)
+
+        aaa_trade = trade_df.loc[trade_df["ticker"] == "AAA"].iloc[0]
+        self.assertEqual(aaa_trade["entry_date"], pd.Timestamp("2025-01-02"))
+        self.assertEqual(aaa_trade["exit_date"], pd.Timestamp("2025-01-06"))
+        self.assertEqual(aaa_trade["exit_reason"], "hard_stop")
+        self.assertAlmostEqual(float(aaa_trade["entry_open"]), 100.0)
+        self.assertAlmostEqual(float(aaa_trade["exit_open"]), 88.0)
+        self.assertAlmostEqual(float(aaa_trade["pnl"]), -12.0)
+        self.assertAlmostEqual(float(aaa_trade["pnl_pct"]), -0.12)
+
+    def test_add_trade_df_flags_open_trades_in_sanity_check(self) -> None:
+        dates = pd.date_range("2025-01-01", periods=3, freq="B")
+        panel = make_stock_frame(
+            "OPEN",
+            [100.0, 101.0, 102.0],
+            dates=dates,
+            open_values=[100.0, 101.0, 102.0],
+        )
+        researcher = BlueChipRangeReversionResearcher(
+            panel,
+            config=RangeStrategyConfig(range_window=3, max_holding_days=10),
+        )
+        prepared = researcher.stock_candle_df.copy()
+        prepared["range_lower"] = 80.0
+        prepared["signal_take_profit_price"] = 120.0
+        prepared["signal_hard_stop_price"] = 90.0
+        prepared["entry_signal"] = False
+        prepared.loc[prepared["date"] == dates[0], "entry_signal"] = True
+        researcher.stock_candle_df = prepared
+        researcher.add_signals = lambda: researcher.stock_candle_df
+
+        trade_df = researcher.add_trade_df()
+
+        self.assertEqual(len(trade_df), 1)
+        self.assertEqual(trade_df["trade_status"].iat[0], "open")
+        self.assertEqual(trade_df["exit_reason"].iat[0], "open_position")
+        self.assertTrue(pd.isna(trade_df["exit_date"].iat[0]))
+        self.assertTrue(pd.isna(trade_df["pnl"].iat[0]))
+        self.assertFalse(trade_df.attrs["all_trades_closed"])
+        self.assertEqual(trade_df.attrs["open_trade_count"], 1)
+        self.assertEqual(trade_df.attrs["open_trade_tickers"], ["OPEN"])
+
     def test_inspect_signal_and_plot_signal_context_return_explainable_context(self) -> None:
         panel, signal_date, _ = make_signal_research_panel()
         researcher = BlueChipRangeReversionResearcher(
@@ -246,6 +313,7 @@ class BlueChipRangeReversionResearcherTest(unittest.TestCase):
             config=RangeStrategyConfig(range_window=20, max_ma_dispersion=0.2),
         )
 
+        self.assertIn("exit_reason", researcher.stock_candle_df.columns)
         inspection = researcher.inspect_signal("AAA", signal_date, lookback=5, lookahead=3)
 
         self.assertEqual(inspection["summary"]["ticker"], "AAA")
@@ -255,10 +323,23 @@ class BlueChipRangeReversionResearcherTest(unittest.TestCase):
         self.assertEqual(inspection["signal_row"]["ticker"].iat[0], "AAA")
         self.assertIn("entry_signal", inspection["condition_checklist"]["condition"].tolist())
         self.assertFalse(inspection["price_window"].empty)
+        self.assertEqual(
+            inspection["price_window"]["date"].max(),
+            signal_date + pd.offsets.BDay(3),
+        )
 
         figure = researcher.plot_signal_context("AAA", signal_date, lookback=5, lookahead=3)
         self.assertIsInstance(figure, go.Figure)
         self.assertGreaterEqual(len(figure.data), 4)
+        self.assertTrue(any("open_position" in getattr(annotation, "text", "") for annotation in figure.layout.annotations))
+
+        closed_researcher = make_manual_outcome_researcher()
+        closed_figure = closed_researcher.plot_signal_context("AAA", pd.Timestamp("2025-01-01"), lookback=1, lookahead=3)
+        self.assertTrue(any("Exit (" in (trace.name or "") for trace in closed_figure.data))
+        self.assertTrue(any("hard_stop" in getattr(annotation, "text", "") for annotation in closed_figure.layout.annotations))
+
+        with self.assertRaisesRegex(ValueError, "suppressed signal"):
+            closed_researcher.inspect_signal("AAA", pd.Timestamp("2025-01-02"), lookback=1, lookahead=2)
 
 
 if __name__ == "__main__":
