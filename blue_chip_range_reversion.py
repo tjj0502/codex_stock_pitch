@@ -72,6 +72,10 @@ class RangeStrategyConfig:
     breakdown_confirm_days: int = 2
     take_profit_r_multiple: float = 2.0
     max_holding_days: int = 20
+    enable_hard_stop: bool = True
+    enable_breakdown_stop: bool = True
+    enable_take_profit: bool = True
+    enable_time_stop: bool = True
 
     def __post_init__(self) -> None:
         if self.universe not in {"csi500", "hs300"}:
@@ -102,8 +106,17 @@ class RangeStrategyConfig:
             raise ValueError("take_profit_r_multiple must be positive.")
         if self.max_holding_days < 1:
             raise ValueError("max_holding_days must be at least 1.")
-        if self.stop_loss_pct * self.take_profit_r_multiple < self.min_amplitude:
-            raise ValueError("too restrict constraint on profit")
+        if not any(
+            [
+                self.enable_hard_stop,
+                self.enable_breakdown_stop,
+                self.enable_take_profit,
+                self.enable_time_stop,
+            ]
+        ):
+            raise ValueError("At least one exit rule must be enabled.")
+        # if self.stop_loss_pct * self.take_profit_r_multiple > self.min_amplitude:
+        #     raise ValueError("too restrict constraint on profit")
 
 
 class BlueChipRangeReversionResearcher:
@@ -169,6 +182,19 @@ class BlueChipRangeReversionResearcher:
         "max_favorable_excursion",
         "max_adverse_excursion",
     ]
+    FEATURE_ANALYSIS_COLUMNS = [
+        "zone_position",
+        "range_amplitude",
+        "expected_upside_to_upper",
+        "ret_60d",
+        "ma_dispersion",
+        "lower_touch_count",
+        "upper_touch_count",
+        "rebound_confirm_count",
+        "holding_days",
+        "max_favorable_excursion",
+        "max_adverse_excursion",
+    ]
     TRADE_COLUMNS = [
         "signal_date",
         "ticker",
@@ -228,7 +254,7 @@ class BlueChipRangeReversionResearcher:
         self.trade_df = pd.DataFrame(columns=self.TRADE_COLUMNS)
         # Precompute the full research state once during initialization so
         # downstream inspection/plotting calls do not repeatedly rebuild it.
-        self.add_research_outcomes()
+        self.add_trade_df()
 
     @classmethod
     def _prepare_input_frame(cls, df: pd.DataFrame) -> pd.DataFrame:
@@ -336,10 +362,11 @@ class BlueChipRangeReversionResearcher:
         # Trend and smoothness features help reject names that are trending
         # too strongly instead of oscillating around a stable range.
         df["ret_60d"] = ticker_group["close"].transform(lambda series: self._rolling_return(series, 60))
-        df["sma_5"] = ticker_group["close"].transform(lambda series: self._rolling_sma(series, 5))
-        df["sma_20"] = ticker_group["close"].transform(lambda series: self._rolling_sma(series, 20))
-        df["sma_60"] = ticker_group["close"].transform(lambda series: self._rolling_sma(series, 60))
-        df["sma_120"] = ticker_group["close"].transform(lambda series: self._rolling_sma(series, 120))
+        sma_windows = sorted({5, *cfg.ma_dispersion_window})
+        for window in sma_windows:
+            df[f"sma_{window}"] = ticker_group["close"].transform(
+                lambda series, current_window=window: self._rolling_sma(series, current_window)
+            )
 
         dispersion_columns = [f"sma_{window}" for window in cfg.ma_dispersion_window]
         ma_max = df[dispersion_columns].max(axis=1)
@@ -451,6 +478,7 @@ class BlueChipRangeReversionResearcher:
         - a signal on ``t`` enters at ``t+1`` open
         - exit conditions are evaluated from each subsequent close
         - once an exit condition is hit, the position exits at the next open
+        - each exit rule can be enabled/disabled from ``RangeStrategyConfig``
         - while a position is open, later same-direction signals are recorded
           as suppressed instead of opening overlapping trades
         """
@@ -506,12 +534,19 @@ class BlueChipRangeReversionResearcher:
                     close_price = eval_row["close"]
                     lower_band = eval_row["range_lower"]
 
-                    if pd.notna(close_price) and pd.notna(stop_price) and close_price <= stop_price:
+                    if (
+                        cfg.enable_hard_stop
+                        and pd.notna(close_price)
+                        and pd.notna(stop_price)
+                        and close_price <= stop_price
+                    ):
                         exit_signal_loc = eval_loc
                         exit_reason = "hard_stop"
                         break
 
                     if (
+                        cfg.enable_breakdown_stop
+                        and
                         pd.notna(close_price)
                         and pd.notna(lower_band)
                         and close_price <= lower_band * (1.0 - cfg.breakdown_buffer)
@@ -520,17 +555,22 @@ class BlueChipRangeReversionResearcher:
                     else:
                         breakdown_streak = 0
 
-                    if breakdown_streak >= cfg.breakdown_confirm_days:
+                    if cfg.enable_breakdown_stop and breakdown_streak >= cfg.breakdown_confirm_days:
                         exit_signal_loc = eval_loc
                         exit_reason = "breakdown_stop"
                         break
 
-                    if pd.notna(close_price) and pd.notna(take_profit_price) and close_price >= take_profit_price:
+                    if (
+                        cfg.enable_take_profit
+                        and pd.notna(close_price)
+                        and pd.notna(take_profit_price)
+                        and close_price >= take_profit_price
+                    ):
                         exit_signal_loc = eval_loc
                         exit_reason = "take_profit"
                         break
 
-                    if eval_loc - entry_loc + 1 >= cfg.max_holding_days:
+                    if cfg.enable_time_stop and eval_loc - entry_loc + 1 >= cfg.max_holding_days:
                         exit_signal_loc = eval_loc
                         exit_reason = "time_stop"
                         break
@@ -631,6 +671,220 @@ class BlueChipRangeReversionResearcher:
         )
 
         return self._store_trade_df(trades)
+
+    def analyze_feature_win_rates(
+        self,
+        *,
+        feature_columns: list[str] | None = None,
+        n_buckets: int = 5,
+        min_bucket_size: int = 3,
+        max_exact_categories: int = 8,
+        closed_only: bool = True,
+        refresh_trade_df: bool = False,
+        pnl_column: str = "pnl_pct",
+    ) -> dict[str, pd.DataFrame]:
+        """
+        Summarize which feature ranges lead to the highest and lowest win rates.
+
+        The method works directly off ``trade_df`` so the output reflects the
+        strategy's trade-level research outcomes rather than candle-level rows.
+        It bins each feature either by exact category values (for low-cardinality
+        numeric features) or by quantiles, then reports win rate and return
+        statistics per bucket.
+        """
+        if n_buckets < 2:
+            raise ValueError("n_buckets must be at least 2.")
+        if min_bucket_size < 1:
+            raise ValueError("min_bucket_size must be at least 1.")
+        if max_exact_categories < 1:
+            raise ValueError("max_exact_categories must be at least 1.")
+
+        trade_df = self.add_trade_df() if refresh_trade_df or self.trade_df.empty else self.trade_df.copy()
+        if trade_df.empty:
+            raise ValueError("trade_df is empty. Generate trades before running feature analysis.")
+        if pnl_column not in trade_df.columns:
+            raise ValueError(f"trade_df does not contain the requested pnl column: {pnl_column}")
+
+        analysis_frame = trade_df.copy()
+        if closed_only and "trade_status" in analysis_frame.columns:
+            analysis_frame = analysis_frame.loc[analysis_frame["trade_status"].eq("closed")].copy()
+        analysis_frame = analysis_frame.loc[analysis_frame[pnl_column].notna()].copy()
+        if analysis_frame.empty:
+            raise ValueError("No closed trades with non-null pnl are available for feature analysis.")
+
+        analysis_frame["win"] = analysis_frame[pnl_column].gt(0)
+        selected_features = feature_columns or list(self.FEATURE_ANALYSIS_COLUMNS)
+
+        bucket_frames: list[pd.DataFrame] = []
+        skipped_features: list[dict[str, object]] = []
+        for feature in selected_features:
+            if feature not in analysis_frame.columns:
+                skipped_features.append({"feature": feature, "reason": "missing_column"})
+                continue
+
+            feature_series = pd.to_numeric(analysis_frame[feature], errors="coerce")
+            valid_mask = feature_series.notna()
+            if valid_mask.sum() < max(min_bucket_size, 2):
+                skipped_features.append({"feature": feature, "reason": "insufficient_non_null_values"})
+                continue
+
+            working = analysis_frame.loc[valid_mask, ["ticker", pnl_column, "win"]].copy()
+            working[feature] = feature_series.loc[valid_mask].astype(float)
+            unique_values = np.sort(working[feature].unique())
+
+            use_exact_categories = len(unique_values) <= max_exact_categories and np.allclose(
+                unique_values, np.round(unique_values)
+            )
+
+            if use_exact_categories:
+                working["feature_bucket"] = working[feature].astype(str)
+                working["bucket_type"] = "exact"
+                working["bucket_order"] = working[feature].rank(method="dense").astype(int)
+            else:
+                try:
+                    bucket_labels = pd.qcut(working[feature], q=n_buckets, duplicates="drop")
+                except ValueError:
+                    skipped_features.append({"feature": feature, "reason": "unable_to_form_buckets"})
+                    continue
+
+                if bucket_labels.nunique(dropna=True) < 2:
+                    skipped_features.append({"feature": feature, "reason": "too_few_distinct_buckets"})
+                    continue
+
+                working["feature_bucket"] = bucket_labels.astype(str)
+                working["bucket_type"] = "quantile"
+                working["bucket_order"] = bucket_labels.cat.codes.astype(int) + 1
+
+            grouped = (
+                working.groupby(["feature_bucket", "bucket_type", "bucket_order"], sort=True)
+                .agg(
+                    count=("win", "size"),
+                    win_count=("win", "sum"),
+                    mean_return=(pnl_column, "mean"),
+                    median_return=(pnl_column, "median"),
+                    feature_min=(feature, "min"),
+                    feature_max=(feature, "max"),
+                )
+                .reset_index()
+            )
+            grouped = grouped.loc[grouped["count"].ge(min_bucket_size)].copy()
+            if grouped.empty:
+                skipped_features.append({"feature": feature, "reason": "no_bucket_meets_min_bucket_size"})
+                continue
+
+            grouped["feature"] = feature
+            grouped["loss_count"] = grouped["count"] - grouped["win_count"]
+            grouped["win_rate"] = grouped["win_count"] / grouped["count"]
+            bucket_frames.append(
+                grouped.loc[
+                    :,
+                    [
+                        "feature",
+                        "bucket_type",
+                        "feature_bucket",
+                        "bucket_order",
+                        "count",
+                        "win_count",
+                        "loss_count",
+                        "win_rate",
+                        "mean_return",
+                        "median_return",
+                        "feature_min",
+                        "feature_max",
+                    ],
+                ]
+            )
+
+        bucket_summary = (
+            pd.concat(bucket_frames, ignore_index=True)
+            if bucket_frames
+            else pd.DataFrame(
+                columns=[
+                    "feature",
+                    "bucket_type",
+                    "feature_bucket",
+                    "bucket_order",
+                    "count",
+                    "win_count",
+                    "loss_count",
+                    "win_rate",
+                    "mean_return",
+                    "median_return",
+                    "feature_min",
+                    "feature_max",
+                ]
+            )
+        )
+        if not bucket_summary.empty:
+            bucket_summary = bucket_summary.sort_values(
+                ["feature", "bucket_order", "feature_bucket"],
+                kind="mergesort",
+                ignore_index=True,
+            )
+
+        best_buckets = pd.DataFrame(columns=bucket_summary.columns)
+        worst_buckets = pd.DataFrame(columns=bucket_summary.columns)
+        feature_summary = pd.DataFrame(
+            columns=[
+                "feature",
+                "bucket_count",
+                "total_trades",
+                "best_bucket",
+                "best_win_rate",
+                "worst_bucket",
+                "worst_win_rate",
+                "win_rate_spread",
+            ]
+        )
+        if not bucket_summary.empty:
+            best_rows: list[pd.Series] = []
+            worst_rows: list[pd.Series] = []
+            feature_rows: list[dict[str, object]] = []
+            for feature, group in bucket_summary.groupby("feature", sort=True):
+                ordered_best = group.sort_values(
+                    ["win_rate", "mean_return", "count", "bucket_order"],
+                    ascending=[False, False, False, True],
+                    kind="mergesort",
+                ).reset_index(drop=True)
+                ordered_worst = group.sort_values(
+                    ["win_rate", "mean_return", "count", "bucket_order"],
+                    ascending=[True, True, False, True],
+                    kind="mergesort",
+                ).reset_index(drop=True)
+                best_row = ordered_best.iloc[0]
+                worst_row = ordered_worst.iloc[0]
+                best_rows.append(best_row)
+                worst_rows.append(worst_row)
+                feature_rows.append(
+                    {
+                        "feature": feature,
+                        "bucket_count": int(len(group)),
+                        "total_trades": int(group["count"].sum()),
+                        "best_bucket": str(best_row["feature_bucket"]),
+                        "best_win_rate": float(best_row["win_rate"]),
+                        "worst_bucket": str(worst_row["feature_bucket"]),
+                        "worst_win_rate": float(worst_row["win_rate"]),
+                        "win_rate_spread": float(best_row["win_rate"] - worst_row["win_rate"]),
+                    }
+                )
+
+            best_buckets = pd.DataFrame(best_rows).reset_index(drop=True)
+            worst_buckets = pd.DataFrame(worst_rows).reset_index(drop=True)
+            feature_summary = pd.DataFrame(feature_rows).sort_values(
+                ["win_rate_spread", "best_win_rate", "feature"],
+                ascending=[False, False, True],
+                kind="mergesort",
+                ignore_index=True,
+            )
+
+        skipped_features_df = pd.DataFrame(skipped_features, columns=["feature", "reason"])
+        return {
+            "bucket_summary": bucket_summary,
+            "feature_summary": feature_summary,
+            "best_buckets": best_buckets,
+            "worst_buckets": worst_buckets,
+            "skipped_features": skipped_features_df,
+        }
 
     def get_candidates(self, as_of_date: str | pd.Timestamp | None = None) -> pd.DataFrame:
         """Return all raw candidates on a signal date, sorted by attractiveness."""

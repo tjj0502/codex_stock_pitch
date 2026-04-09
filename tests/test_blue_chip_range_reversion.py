@@ -101,7 +101,9 @@ def make_signal_research_panel() -> tuple[pd.DataFrame, pd.Timestamp, pd.Timesta
     return panel, dates[125], dates[126]
 
 
-def make_manual_outcome_researcher() -> BlueChipRangeReversionResearcher:
+def make_manual_outcome_researcher(
+    config: RangeStrategyConfig | None = None,
+) -> BlueChipRangeReversionResearcher:
     dates = pd.date_range("2025-01-01", periods=5, freq="B")
     panel = pd.concat(
         [
@@ -114,7 +116,7 @@ def make_manual_outcome_researcher() -> BlueChipRangeReversionResearcher:
     )
     researcher = BlueChipRangeReversionResearcher(
         panel,
-        config=RangeStrategyConfig(range_window=5, max_holding_days=2),
+        config=config or RangeStrategyConfig(range_window=5, max_holding_days=2),
     )
     prepared = researcher.stock_candle_df.copy()
     prepared["range_lower"] = 80.0
@@ -240,6 +242,73 @@ class BlueChipRangeReversionResearcherTest(unittest.TestCase):
         self.assertTrue(bool(aaa_rows.loc[2, "entry_signal_suppressed"]))
         self.assertFalse(bool(aaa_rows.loc[1, "entry_signal_executed"]))
 
+    def test_add_research_outcomes_respects_enabled_exit_rule_booleans(self) -> None:
+        no_hard_stop = make_manual_outcome_researcher(
+            config=RangeStrategyConfig(
+                range_window=5,
+                max_holding_days=2,
+                enable_hard_stop=False,
+            )
+        )
+        no_hard_stop.add_research_outcomes()
+        no_hard_stop_rows = no_hard_stop.stock_candle_df.groupby("ticker", sort=False).head(1).set_index("ticker")
+        self.assertEqual(no_hard_stop_rows.loc["AAA", "exit_reason"], "time_stop")
+
+        no_breakdown_stop = make_manual_outcome_researcher(
+            config=RangeStrategyConfig(
+                range_window=5,
+                max_holding_days=2,
+                enable_breakdown_stop=False,
+            )
+        )
+        no_breakdown_stop.add_research_outcomes()
+        no_breakdown_rows = (
+            no_breakdown_stop.stock_candle_df.groupby("ticker", sort=False).head(1).set_index("ticker")
+        )
+        self.assertEqual(no_breakdown_rows.loc["BBB", "exit_reason"], "time_stop")
+
+        no_take_profit = make_manual_outcome_researcher(
+            config=RangeStrategyConfig(
+                range_window=5,
+                max_holding_days=2,
+                enable_take_profit=False,
+            )
+        )
+        no_take_profit.add_research_outcomes()
+        no_take_profit_rows = (
+            no_take_profit.stock_candle_df.groupby("ticker", sort=False).head(1).set_index("ticker")
+        )
+        self.assertEqual(no_take_profit_rows.loc["CCC", "exit_reason"], "time_stop")
+
+        no_time_stop = make_manual_outcome_researcher(
+            config=RangeStrategyConfig(
+                range_window=5,
+                max_holding_days=2,
+                enable_hard_stop=True,
+                enable_breakdown_stop=False,
+                enable_take_profit=False,
+                enable_time_stop=False,
+            )
+        )
+        no_time_stop.add_research_outcomes()
+        no_time_stop_rows = (
+            no_time_stop.stock_candle_df.groupby("ticker", sort=False).head(1).set_index("ticker")
+        )
+        self.assertEqual(no_time_stop_rows.loc["AAA", "exit_reason"], "hard_stop")
+        self.assertEqual(no_time_stop_rows.loc["DDD", "exit_reason"], "open_position")
+        self.assertTrue(pd.isna(no_time_stop_rows.loc["DDD", "exit_date_next"]))
+
+    def test_range_strategy_config_requires_at_least_one_exit_rule(self) -> None:
+        with self.assertRaisesRegex(ValueError, "At least one exit rule must be enabled"):
+            RangeStrategyConfig(
+                range_window=5,
+                max_holding_days=2,
+                enable_hard_stop=False,
+                enable_breakdown_stop=False,
+                enable_take_profit=False,
+                enable_time_stop=False,
+            )
+
     def test_add_trade_df_builds_trade_level_output_for_closed_trades(self) -> None:
         researcher = make_manual_outcome_researcher()
         trade_df = researcher.add_trade_df()
@@ -305,6 +374,40 @@ class BlueChipRangeReversionResearcherTest(unittest.TestCase):
         self.assertFalse(trade_df.attrs["all_trades_closed"])
         self.assertEqual(trade_df.attrs["open_trade_count"], 1)
         self.assertEqual(trade_df.attrs["open_trade_tickers"], ["OPEN"])
+
+    def test_analyze_feature_win_rates_identifies_best_and_worst_feature_ranges(self) -> None:
+        researcher = make_manual_outcome_researcher()
+        researcher.trade_df = pd.DataFrame(
+            {
+                "ticker": ["A", "B", "C", "D", "E", "F", "G"],
+                "trade_status": ["closed", "closed", "closed", "closed", "closed", "closed", "open"],
+                "pnl_pct": [0.12, 0.08, -0.03, -0.05, 0.04, -0.01, np.nan],
+                "zone_position": [0.05, 0.10, 0.15, 0.40, 0.45, 0.50, 0.30],
+                "rebound_confirm_count": [3, 3, 2, 2, 1, 1, 2],
+            }
+        )
+
+        analysis = researcher.analyze_feature_win_rates(
+            feature_columns=["zone_position", "rebound_confirm_count", "missing_feature"],
+            n_buckets=2,
+            min_bucket_size=2,
+        )
+
+        bucket_summary = analysis["bucket_summary"]
+        feature_summary = analysis["feature_summary"].set_index("feature")
+        best_buckets = analysis["best_buckets"].set_index("feature")
+        worst_buckets = analysis["worst_buckets"].set_index("feature")
+        skipped = analysis["skipped_features"].set_index("feature")
+
+        self.assertFalse(bucket_summary.empty)
+        self.assertEqual(set(feature_summary.index.tolist()), {"zone_position", "rebound_confirm_count"})
+        self.assertAlmostEqual(feature_summary.loc["zone_position", "best_win_rate"], 2.0 / 3.0)
+        self.assertAlmostEqual(feature_summary.loc["zone_position", "worst_win_rate"], 1.0 / 3.0)
+        self.assertAlmostEqual(float(best_buckets.loc["zone_position", "feature_min"]), 0.05)
+        self.assertAlmostEqual(float(best_buckets.loc["zone_position", "feature_max"]), 0.15)
+        self.assertEqual(str(best_buckets.loc["rebound_confirm_count", "feature_bucket"]), "3.0")
+        self.assertEqual(str(worst_buckets.loc["rebound_confirm_count", "feature_bucket"]), "2.0")
+        self.assertEqual(skipped.loc["missing_feature", "reason"], "missing_column")
 
     def test_inspect_signal_and_plot_signal_context_return_explainable_context(self) -> None:
         panel, signal_date, _ = make_signal_research_panel()

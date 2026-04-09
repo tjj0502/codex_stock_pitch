@@ -3,7 +3,7 @@ import unittest
 import pandas as pd
 import plotly.graph_objects as go
 
-from backtester import Backtester, ExecutionCostModel, ScoringBacktester
+from backtester import Backtester, ExecutionCostModel, ScoringBacktester, TradePlanBacktester
 
 
 def make_quote_frame(
@@ -81,6 +81,15 @@ class StaticScorer:
 
         self.stock_candle_df = df.sort_values(["date", "ticker"], kind="mergesort", ignore_index=True)
         return self.stock_candle_df
+
+
+class StaticTradeResearcher:
+    def __init__(self, stock_candle_df: pd.DataFrame, *, trade_df: pd.DataFrame, copy: bool = True) -> None:
+        self.stock_candle_df = stock_candle_df.copy(deep=True) if copy else stock_candle_df
+        self.trade_df = trade_df.copy(deep=True)
+
+    def add_trade_df(self) -> pd.DataFrame:
+        return self.trade_df.copy(deep=True)
 
 
 class BacktesterTest(unittest.TestCase):
@@ -429,6 +438,286 @@ class BacktesterTest(unittest.TestCase):
         execution_view = backtester.inspect_selection("AAA", dates[1], date_kind="execution")
         self.assertEqual(execution_view["summary"]["signal_date"], dates[0])
         self.assertEqual(execution_view["summary"]["execution_date"], dates[1])
+
+    def test_trade_plan_backtester_uses_trade_df_and_reports_strategy_trade_metrics(self) -> None:
+        dates = pd.date_range("2025-01-01", periods=4, freq="B")
+        panel = pd.concat(
+            [
+                make_quote_frame(
+                    "AAA",
+                    dates,
+                    [10.0, 10.0, 10.8, 12.0],
+                    close_values=[10.0, 10.0, 10.8, 12.0],
+                    pre_close_values=[10.0, 10.0, 10.0, 11.0],
+                ),
+                make_quote_frame(
+                    "BBB",
+                    dates,
+                    [20.0, 20.0, 19.0, 19.0],
+                    close_values=[20.0, 20.0, 19.0, 19.0],
+                    pre_close_values=[20.0, 20.0, 20.0, 19.0],
+                ),
+            ],
+            ignore_index=True,
+        )
+        trade_plan = pd.DataFrame(
+            {
+                "signal_date": [dates[0], dates[0]],
+                "ticker": ["AAA", "BBB"],
+                "ts_code": ["AAA.SZ", "BBB.SZ"],
+                "name": ["AAA Corp", "BBB Corp"],
+                "entry_date": [dates[1], dates[1]],
+                "exit_date": [dates[2], dates[3]],
+                "exit_reason": ["take_profit", "time_stop"],
+            }
+        )
+
+        backtester = TradePlanBacktester(
+            panel,
+            researcher=StaticTradeResearcher,
+            researcher_kwargs={"trade_df": trade_plan},
+            initial_capital=200.0,
+            board_lot_size=1,
+            costs=self.ZERO_COSTS,
+        )
+        results = backtester.compute_metrics()
+
+        self.assertIn("strategy_trades", results)
+        self.assertIn("trade_summary", results)
+        self.assertEqual(
+            list(zip(results["trades"]["date"], results["trades"]["side"], results["trades"]["ticker"])),
+            [
+                (dates[1], "buy", "AAA"),
+                (dates[1], "buy", "BBB"),
+                (dates[2], "sell", "AAA"),
+                (dates[3], "sell", "BBB"),
+            ],
+        )
+        self.assertAlmostEqual(results["summary"]["total_return"], 0.015)
+        self.assertEqual(results["summary"]["planned_trade_count"], 2)
+        self.assertEqual(results["summary"]["entered_trade_count"], 2)
+        self.assertEqual(results["summary"]["closed_trade_count"], 2)
+        self.assertAlmostEqual(results["summary"]["entry_fill_rate"], 1.0)
+        self.assertAlmostEqual(results["summary"]["trade_win_rate"], 0.5)
+
+        strategy_trades = results["strategy_trades"].set_index("ticker")
+        self.assertEqual(strategy_trades.loc["AAA", "entry_order_status"], "executed")
+        self.assertEqual(strategy_trades.loc["AAA", "actual_trade_status"], "closed")
+        self.assertEqual(strategy_trades.loc["AAA", "actual_entry_shares"], 10)
+        self.assertAlmostEqual(float(strategy_trades.loc["AAA", "actual_pnl"]), 8.0)
+        self.assertEqual(strategy_trades.loc["BBB", "actual_entry_shares"], 5)
+        self.assertAlmostEqual(float(strategy_trades.loc["BBB", "actual_pnl"]), -5.0)
+
+    def test_trade_plan_backtester_attempts_entry_only_once_when_buy_is_blocked(self) -> None:
+        dates = pd.date_range("2025-01-01", periods=4, freq="B")
+        panel = make_quote_frame(
+            "AAA",
+            dates,
+            [10.0, 11.0, 9.0, 9.5],
+            close_values=[10.0, 11.0, 9.0, 9.5],
+            pre_close_values=[10.0, 10.0, 11.0, 9.0],
+        )
+        trade_plan = pd.DataFrame(
+            {
+                "signal_date": [dates[0]],
+                "ticker": ["AAA"],
+                "entry_date": [dates[1]],
+                "exit_date": [dates[3]],
+                "exit_reason": ["time_stop"],
+            }
+        )
+
+        backtester = TradePlanBacktester(
+            panel,
+            trade_df=trade_plan,
+            initial_capital=100.0,
+            board_lot_size=1,
+            costs=self.ZERO_COSTS,
+        )
+        results = backtester.compute_metrics()
+        strategy_trade = results["strategy_trades"].iloc[0]
+
+        self.assertTrue(results["trades"].empty)
+        self.assertEqual(strategy_trade["entry_order_status"], "blocked_limit")
+        self.assertEqual(strategy_trade["actual_trade_status"], "not_entered")
+        self.assertTrue(pd.isna(strategy_trade["actual_entry_date"]))
+
+    def test_trade_plan_backtester_retries_exits_until_they_trade(self) -> None:
+        dates = pd.date_range("2025-01-01", periods=4, freq="B")
+        panel = make_quote_frame(
+            "AAA",
+            dates,
+            [10.0, 10.0, 9.0, 8.0],
+            close_values=[10.0, 10.0, 9.0, 8.0],
+            pre_close_values=[10.0, 10.0, 10.0, 9.0],
+        )
+        trade_plan = pd.DataFrame(
+            {
+                "signal_date": [dates[0]],
+                "ticker": ["AAA"],
+                "entry_date": [dates[1]],
+                "exit_date": [dates[2]],
+                "exit_reason": ["hard_stop"],
+            }
+        )
+
+        backtester = TradePlanBacktester(
+            panel,
+            trade_df=trade_plan,
+            initial_capital=100.0,
+            board_lot_size=1,
+            costs=self.ZERO_COSTS,
+        )
+        results = backtester.compute_metrics()
+        strategy_trade = results["strategy_trades"].iloc[0]
+
+        self.assertEqual(results["trades"]["side"].tolist(), ["buy", "sell"])
+        self.assertEqual(results["trades"]["date"].tolist(), [dates[1], dates[3]])
+        self.assertEqual(strategy_trade["entry_order_status"], "executed")
+        self.assertEqual(strategy_trade["actual_exit_date"], dates[3])
+        self.assertEqual(strategy_trade["actual_exit_reason"], "hard_stop")
+        self.assertEqual(strategy_trade["actual_trade_status"], "closed")
+        self.assertEqual(strategy_trade["actual_holding_days"], 2)
+
+    def test_trade_plan_backtester_can_size_entries_by_fixed_notional(self) -> None:
+        dates = pd.date_range("2025-01-01", periods=3, freq="B")
+        panel = pd.concat(
+            [
+                make_quote_frame(
+                    "AAA",
+                    dates,
+                    [12.0, 12.0, 12.5],
+                    close_values=[12.0, 12.0, 12.5],
+                    pre_close_values=[12.0, 12.0, 12.0],
+                ),
+                make_quote_frame(
+                    "BBB",
+                    dates,
+                    [9.8, 9.8, 10.0],
+                    close_values=[9.8, 9.8, 10.0],
+                    pre_close_values=[9.8, 9.8, 9.8],
+                ),
+            ],
+            ignore_index=True,
+        )
+        trade_plan = pd.DataFrame(
+            {
+                "signal_date": [dates[0], dates[0]],
+                "ticker": ["AAA", "BBB"],
+                "entry_date": [dates[1], dates[1]],
+                "exit_date": [dates[2], dates[2]],
+                "exit_reason": ["time_stop", "time_stop"],
+            }
+        )
+
+        backtester = TradePlanBacktester(
+            panel,
+            trade_df=trade_plan,
+            initial_capital=100_000.0,
+            board_lot_size=100,
+            fixed_entry_notional=25_000.0,
+            costs=self.ZERO_COSTS,
+        )
+        results = backtester.compute_metrics()
+        strategy_trades = results["strategy_trades"].set_index("ticker")
+
+        self.assertEqual(strategy_trades.loc["AAA", "actual_entry_shares"], 2000)
+        self.assertEqual(strategy_trades.loc["BBB", "actual_entry_shares"], 2500)
+        self.assertAlmostEqual(float(strategy_trades.loc["AAA", "target_entry_budget"]), 25_000.0)
+        self.assertAlmostEqual(float(strategy_trades.loc["BBB", "target_entry_budget"]), 25_000.0)
+        self.assertLessEqual(
+            float(strategy_trades.loc["AAA", "actual_entry_gross_notional"]),
+            25_000.0,
+        )
+        self.assertLessEqual(
+            float(strategy_trades.loc["BBB", "actual_entry_gross_notional"]),
+            25_000.0,
+        )
+        self.assertAlmostEqual(results["summary"]["fixed_entry_notional"], 25_000.0)
+
+    def test_trade_plan_backtester_marks_trade_when_fixed_notional_is_below_one_lot(self) -> None:
+        dates = pd.date_range("2025-01-01", periods=3, freq="B")
+        panel = make_quote_frame(
+            "AAA",
+            dates,
+            [10.0, 10.0, 10.2],
+            close_values=[10.0, 10.0, 10.2],
+            pre_close_values=[10.0, 10.0, 10.0],
+        )
+        trade_plan = pd.DataFrame(
+            {
+                "signal_date": [dates[0]],
+                "ticker": ["AAA"],
+                "entry_date": [dates[1]],
+                "exit_date": [dates[2]],
+                "exit_reason": ["time_stop"],
+            }
+        )
+
+        backtester = TradePlanBacktester(
+            panel,
+            trade_df=trade_plan,
+            initial_capital=100_000.0,
+            board_lot_size=100,
+            fixed_entry_notional=900.0,
+            costs=self.ZERO_COSTS,
+        )
+        results = backtester.compute_metrics()
+        strategy_trade = results["strategy_trades"].iloc[0]
+
+        self.assertTrue(results["trades"].empty)
+        self.assertEqual(strategy_trade["entry_order_status"], "skipped_position_budget")
+        self.assertEqual(strategy_trade["actual_trade_status"], "not_entered")
+        self.assertAlmostEqual(float(strategy_trade["target_entry_budget"]), 900.0)
+        self.assertAlmostEqual(results["summary"]["fixed_entry_notional"], 900.0)
+
+    def test_trade_plan_backtester_show_metrics_returns_trade_execution_figure(self) -> None:
+        dates = pd.date_range("2025-01-01", periods=4, freq="B")
+        panel = pd.concat(
+            [
+                make_quote_frame(
+                    "AAA",
+                    dates,
+                    [10.0, 10.0, 10.8, 11.2],
+                    close_values=[10.0, 10.0, 10.8, 11.2],
+                    pre_close_values=[10.0, 10.0, 10.0, 10.8],
+                ),
+                make_quote_frame(
+                    "BBB",
+                    dates,
+                    [20.0, 20.0, 19.0, 19.0],
+                    close_values=[20.0, 20.0, 19.0, 19.0],
+                    pre_close_values=[20.0, 20.0, 20.0, 19.0],
+                ),
+            ],
+            ignore_index=True,
+        )
+        trade_plan = pd.DataFrame(
+            {
+                "signal_date": [dates[0], dates[0]],
+                "ticker": ["AAA", "BBB"],
+                "entry_date": [dates[1], dates[1]],
+                "exit_date": [dates[2], dates[3]],
+                "exit_reason": ["take_profit", "time_stop"],
+            }
+        )
+        backtester = TradePlanBacktester(
+            panel,
+            trade_df=trade_plan,
+            initial_capital=200.0,
+            board_lot_size=1,
+            costs=self.ZERO_COSTS,
+        )
+
+        figure = backtester.show_metrics()
+        trace_names = {trace.name for trace in figure.data}
+
+        self.assertIsInstance(figure, go.Figure)
+        self.assertGreaterEqual(len(figure.data), 11)
+        self.assertTrue(
+            {"Planned Entries", "Actual Entries", "Actual Exits", "Realized PnL"}.issubset(trace_names)
+        )
+        self.assertIn("Trade Plan Backtest Metrics", str(figure.layout.title.text))
 
     def test_plot_selection_context_returns_plotly_figure(self) -> None:
         dates = pd.date_range("2025-01-01", periods=4, freq="B")
