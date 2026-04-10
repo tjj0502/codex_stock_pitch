@@ -76,6 +76,14 @@ class RangeStrategyConfig:
     enable_breakdown_stop: bool = True
     enable_take_profit: bool = True
     enable_time_stop: bool = True
+    enable_price_action_confirmation: bool = True
+    double_bottom_lookback: int = 20
+    double_bottom_min_separation: int = 3
+    double_bottom_tolerance: float = 0.03
+    double_bottom_min_bounce: float = 0.03
+    long_lower_shadow_min_ratio: float = 0.50
+    follow_through_min_body_ratio: float = 0.50
+    follow_through_require_close_above_prev_high: bool = True
 
     def __post_init__(self) -> None:
         if self.universe not in {"csi500", "hs300"}:
@@ -106,6 +114,20 @@ class RangeStrategyConfig:
             raise ValueError("take_profit_r_multiple must be positive.")
         if self.max_holding_days < 1:
             raise ValueError("max_holding_days must be at least 1.")
+        if self.double_bottom_lookback < 2:
+            raise ValueError("double_bottom_lookback must be at least 2.")
+        if self.double_bottom_min_separation < 1:
+            raise ValueError("double_bottom_min_separation must be at least 1.")
+        if self.double_bottom_lookback <= self.double_bottom_min_separation:
+            raise ValueError("double_bottom_lookback must be larger than double_bottom_min_separation.")
+        if self.double_bottom_tolerance < 0:
+            raise ValueError("double_bottom_tolerance must be non-negative.")
+        if self.double_bottom_min_bounce < 0:
+            raise ValueError("double_bottom_min_bounce must be non-negative.")
+        if not 0 <= self.long_lower_shadow_min_ratio <= 1:
+            raise ValueError("long_lower_shadow_min_ratio must be in [0, 1].")
+        if not 0 <= self.follow_through_min_body_ratio <= 1:
+            raise ValueError("follow_through_min_body_ratio must be in [0, 1].")
         if not any(
             [
                 self.enable_hard_stop,
@@ -154,15 +176,25 @@ class BlueChipRangeReversionResearcher:
         "lower_touch_count",
         "upper_touch_count",
         "expected_upside_to_upper",
+        "real_body",
+        "full_range",
+        "lower_shadow",
+        "upper_shadow",
+        "lower_shadow_ratio",
+        "body_ratio",
         "close_gt_open",
         "close_gt_prev_close",
         "close_gt_sma_5",
         "rebound_confirm_count",
+        "double_bottom_h2_pattern",
+        "long_lower_shadow_follow_through_pattern",
+        "price_action_confirmed",
         "range_candidate",
     ]
     SIGNAL_COLUMNS = [
         "entry_zone_ok",
         "expected_upside_ok",
+        "basic_rebound_confirmed",
         "rebound_confirmed",
         "signal_take_profit_price",
         "signal_hard_stop_price",
@@ -191,6 +223,10 @@ class BlueChipRangeReversionResearcher:
         "lower_touch_count",
         "upper_touch_count",
         "rebound_confirm_count",
+        "basic_rebound_confirmed",
+        "price_action_confirmed",
+        "double_bottom_h2_pattern",
+        "long_lower_shadow_follow_through_pattern",
         "holding_days",
         "max_favorable_excursion",
         "max_adverse_excursion",
@@ -217,6 +253,10 @@ class BlueChipRangeReversionResearcher:
         "lower_touch_count",
         "upper_touch_count",
         "rebound_confirm_count",
+        "basic_rebound_confirmed",
+        "price_action_confirmed",
+        "double_bottom_h2_pattern",
+        "long_lower_shadow_follow_through_pattern",
         "entry_date",
         "entry_open",
         "signal_take_profit_price",
@@ -345,6 +385,86 @@ class BlueChipRangeReversionResearcher:
     def _safe_ratio(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
         return numerator.div(denominator.where(denominator.ne(0)))
 
+    def _detect_double_bottom_h2_pattern(self, group: pd.DataFrame) -> pd.Series:
+        """
+        Detect a programmatic "double bottom / H2" style reversal.
+
+        The current bar must still live near the lower band. We then search a
+        bounded lookback window for an earlier low at a similar price, with a
+        meaningful bounce in between the two lows.
+        """
+        cfg = self.config
+        lows = pd.to_numeric(group["low"], errors="coerce").to_numpy(dtype=float)
+        highs = pd.to_numeric(group["high"], errors="coerce").to_numpy(dtype=float)
+        zone_position = pd.to_numeric(group["zone_position"], errors="coerce").to_numpy(dtype=float)
+        near_lower_band = np.isfinite(zone_position) & (zone_position <= cfg.entry_zone_threshold)
+        pattern = np.zeros(len(group), dtype=bool)
+
+        for current_idx in range(len(group)):
+            if not near_lower_band[current_idx]:
+                continue
+            current_low = lows[current_idx]
+            if not np.isfinite(current_low) or current_low <= 0:
+                continue
+
+            search_start = max(0, current_idx - cfg.double_bottom_lookback)
+            search_end = current_idx - cfg.double_bottom_min_separation
+            if search_end < search_start:
+                continue
+
+            for prior_idx in range(search_end, search_start - 1, -1):
+                prior_low = lows[prior_idx]
+                if not np.isfinite(prior_low) or prior_low <= 0:
+                    continue
+                if abs(current_low / prior_low - 1.0) > cfg.double_bottom_tolerance:
+                    continue
+
+                middle_highs = highs[prior_idx + 1 : current_idx]
+                finite_middle_highs = middle_highs[np.isfinite(middle_highs)]
+                if finite_middle_highs.size == 0:
+                    continue
+
+                bounce_base = min(prior_low, current_low)
+                if bounce_base <= 0:
+                    continue
+
+                bounce = float(finite_middle_highs.max() / bounce_base - 1.0)
+                if bounce >= cfg.double_bottom_min_bounce:
+                    pattern[current_idx] = True
+                    break
+
+        return pd.Series(pattern, index=group.index, dtype=bool)
+
+    def _detect_long_lower_shadow_follow_through_pattern(self, group: pd.DataFrame) -> pd.Series:
+        """Detect a rejection candle followed by a strong bullish confirmation day."""
+        cfg = self.config
+        previous_rejection = (
+            group["full_range"].gt(0)
+            & group["lower_shadow_ratio"].ge(cfg.long_lower_shadow_min_ratio)
+            & group["close"].ge(group["low"] + 0.5 * group["full_range"])
+        )
+        current_follow_through = (
+            group["full_range"].gt(0)
+            & group["close"].gt(group["open"])
+            & group["body_ratio"].ge(cfg.follow_through_min_body_ratio)
+        )
+        if cfg.follow_through_require_close_above_prev_high:
+            current_follow_through = current_follow_through & group["close"].gt(group["high"].shift(1))
+
+        return (previous_rejection.shift(1, fill_value=False) & current_follow_through).astype(bool)
+
+    @staticmethod
+    def _price_action_labels(signal_row: pd.DataFrame) -> list[str]:
+        labels: list[str] = []
+        if "double_bottom_h2_pattern" in signal_row.columns and bool(signal_row["double_bottom_h2_pattern"].iat[0]):
+            labels.append("Double Bottom / H2")
+        if (
+            "long_lower_shadow_follow_through_pattern" in signal_row.columns
+            and bool(signal_row["long_lower_shadow_follow_through_pattern"].iat[0])
+        ):
+            labels.append("Long Lower Shadow + Follow-Through")
+        return labels
+
     def add_features(self) -> pd.DataFrame:
         """
         Derive all raw research features from daily candles.
@@ -409,11 +529,30 @@ class BlueChipRangeReversionResearcher:
         df["expected_upside_to_upper"] = self._safe_ratio(df["range_upper"] - df["close"], df["close"]).replace(
             [np.inf, -np.inf], np.nan
         )
+        df["real_body"] = (df["close"] - df["open"]).abs()
+        df["full_range"] = (df["high"] - df["low"]).where(df["high"].ge(df["low"]))
+        df["lower_shadow"] = (np.minimum(df["open"], df["close"]) - df["low"]).clip(lower=0)
+        df["upper_shadow"] = (df["high"] - np.maximum(df["open"], df["close"])).clip(lower=0)
+        df["lower_shadow_ratio"] = self._safe_ratio(df["lower_shadow"], df["full_range"]).replace(
+            [np.inf, -np.inf], np.nan
+        )
+        df["body_ratio"] = self._safe_ratio(df["real_body"], df["full_range"]).replace([np.inf, -np.inf], np.nan)
         df["close_gt_open"] = df["close"].gt(df["open"])
         df["close_gt_prev_close"] = df.groupby("ticker", sort=False)["close"].diff().gt(0)
         df["close_gt_sma_5"] = df["close"].gt(df["sma_5"])
         df["rebound_confirm_count"] = (
             df[["close_gt_open", "close_gt_prev_close", "close_gt_sma_5"]].fillna(False).sum(axis=1).astype(int)
+        )
+        double_bottom_pattern = pd.Series(False, index=df.index, dtype=bool)
+        long_lower_shadow_pattern = pd.Series(False, index=df.index, dtype=bool)
+        for _, group_index in df.groupby("ticker", sort=False).groups.items():
+            group = df.loc[group_index].copy()
+            double_bottom_pattern.loc[group_index] = self._detect_double_bottom_h2_pattern(group)
+            long_lower_shadow_pattern.loc[group_index] = self._detect_long_lower_shadow_follow_through_pattern(group)
+        df["double_bottom_h2_pattern"] = double_bottom_pattern.astype(bool)
+        df["long_lower_shadow_follow_through_pattern"] = long_lower_shadow_pattern.astype(bool)
+        df["price_action_confirmed"] = (
+            df["double_bottom_h2_pattern"] | df["long_lower_shadow_follow_through_pattern"]
         )
 
         # ``range_candidate`` is the coarse universe filter. A later signal
@@ -449,7 +588,11 @@ class BlueChipRangeReversionResearcher:
         df["entry_open_next"] = ticker_group["open"].shift(-1)
         df["entry_zone_ok"] = df["zone_position"].le(cfg.entry_zone_threshold)
         df["expected_upside_ok"] = df["expected_upside_to_upper"].ge(cfg.stop_loss_pct * cfg.take_profit_r_multiple)
-        df["rebound_confirmed"] = df["rebound_confirm_count"].ge(2)
+        df["basic_rebound_confirmed"] = df["rebound_confirm_count"].ge(2)
+        if cfg.enable_price_action_confirmation:
+            df["rebound_confirmed"] = df["basic_rebound_confirmed"] & df["price_action_confirmed"]
+        else:
+            df["rebound_confirmed"] = df["basic_rebound_confirmed"]
         # Take-profit is capped by both the structural upper band and the 2R
         # target implied by the configured stop distance.
         df["signal_take_profit_price"] = np.minimum(
@@ -916,6 +1059,10 @@ class BlueChipRangeReversionResearcher:
             "zone_position",
             "expected_upside_to_upper",
             "rebound_confirm_count",
+            "basic_rebound_confirmed",
+            "price_action_confirmed",
+            "double_bottom_h2_pattern",
+            "long_lower_shadow_follow_through_pattern",
             "entry_signal",
         ]
         optional_columns = [column for column in self.OUTCOME_COLUMNS if column in candidates.columns]
@@ -966,6 +1113,7 @@ class BlueChipRangeReversionResearcher:
 
         signal_row = executed_rows.iloc[[0]].copy().reset_index(drop=True)
         signal_loc = int(ticker_frame.index[ticker_frame["date"] == target_date][0])
+        read_bool = lambda column: bool(signal_row[column].iat[0]) if column in signal_row.columns else False
 
         start_loc = max(0, signal_loc - lookback)
         end_loc = min(len(ticker_frame), signal_loc + lookahead + 1)
@@ -980,6 +1128,10 @@ class BlueChipRangeReversionResearcher:
                     "range_candidate",
                     "entry_zone_ok",
                     "expected_upside_ok",
+                    "basic_rebound_confirmed",
+                    "price_action_confirmed",
+                    "double_bottom_h2_pattern",
+                    "long_lower_shadow_follow_through_pattern",
                     "rebound_confirmed",
                     "close_gt_open",
                     "close_gt_prev_close",
@@ -988,15 +1140,19 @@ class BlueChipRangeReversionResearcher:
                     "entry_signal_executed",
                 ],
                 "value": [
-                    bool(signal_row["range_candidate"].iat[0]),
-                    bool(signal_row["entry_zone_ok"].iat[0]),
-                    bool(signal_row["expected_upside_ok"].iat[0]),
-                    bool(signal_row["rebound_confirmed"].iat[0]),
-                    bool(signal_row["close_gt_open"].iat[0]),
-                    bool(signal_row["close_gt_prev_close"].iat[0]),
-                    bool(signal_row["close_gt_sma_5"].iat[0]),
-                    bool(signal_row["entry_signal"].iat[0]),
-                    bool(signal_row["entry_signal_executed"].iat[0]),
+                    read_bool("range_candidate"),
+                    read_bool("entry_zone_ok"),
+                    read_bool("expected_upside_ok"),
+                    read_bool("basic_rebound_confirmed"),
+                    read_bool("price_action_confirmed"),
+                    read_bool("double_bottom_h2_pattern"),
+                    read_bool("long_lower_shadow_follow_through_pattern"),
+                    read_bool("rebound_confirmed"),
+                    read_bool("close_gt_open"),
+                    read_bool("close_gt_prev_close"),
+                    read_bool("close_gt_sma_5"),
+                    read_bool("entry_signal"),
+                    read_bool("entry_signal_executed"),
                 ],
             }
         )
@@ -1004,8 +1160,11 @@ class BlueChipRangeReversionResearcher:
         summary = {
             "ticker": ticker,
             "signal_date": target_date,
-            "raw_signal": bool(signal_row["entry_signal"].iat[0]),
-            "executed_signal": bool(signal_row["entry_signal_executed"].iat[0]),
+            "raw_signal": read_bool("entry_signal"),
+            "executed_signal": read_bool("entry_signal_executed"),
+            "basic_rebound_confirmed": read_bool("basic_rebound_confirmed"),
+            "price_action_confirmed": read_bool("price_action_confirmed"),
+            "price_action_labels": self._price_action_labels(signal_row),
             "entry_date_next": signal_row["entry_date_next"].iat[0],
             "entry_open_next": float(signal_row["entry_open_next"].iat[0])
             if pd.notna(signal_row["entry_open_next"].iat[0])
@@ -1044,6 +1203,10 @@ class BlueChipRangeReversionResearcher:
             "upper_touch_count",
             "expected_upside_to_upper",
             "rebound_confirm_count",
+            "basic_rebound_confirmed",
+            "price_action_confirmed",
+            "double_bottom_h2_pattern",
+            "long_lower_shadow_follow_through_pattern",
             "entry_date_next",
             "entry_open_next",
             "signal_take_profit_price",
@@ -1128,6 +1291,20 @@ class BlueChipRangeReversionResearcher:
             None if pd.isna(signal_row["exit_reason"].iat[0]) else str(signal_row["exit_reason"].iat[0])
         )
         figure.add_vline(x=signal_row["date"].iat[0], line_dash="dash", line_color="royalblue", row=1, col=1)
+        price_action_labels = self._price_action_labels(signal_row)
+        if price_action_labels:
+            figure.add_annotation(
+                x=0.01,
+                y=0.98,
+                xref="paper",
+                yref="paper",
+                text="Price Action<br>" + "<br>".join(price_action_labels),
+                showarrow=False,
+                align="left",
+                bgcolor="rgba(255,255,255,0.85)",
+                bordercolor="royalblue",
+                borderwidth=1,
+            )
         if pd.notna(entry_date):
             entry_rows = price_window[price_window["date"] == entry_date]
             entry_price = signal_row["entry_open_next"].iat[0]

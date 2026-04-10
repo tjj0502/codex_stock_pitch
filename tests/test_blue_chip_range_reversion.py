@@ -69,9 +69,13 @@ def make_signal_research_panel() -> tuple[pd.DataFrame, pd.Timestamp, pd.Timesta
     x = np.linspace(0, 14 * np.pi, len(dates))
 
     aaa_closes = 100 + 18 * np.sin(x)
-    aaa_closes[-5:] = [88.0, 84.0, 82.0, 84.0, 86.0]
+    aaa_closes[-6:] = [96.0, 85.5, 87.2, 84.4, 83.0, 85.0]
     aaa_opens = aaa_closes - 1.0
-    aaa_opens[-5:] = [86.5, 82.5, 81.0, 82.5, 84.0]
+    aaa_opens[-6:] = [97.0, 86.0, 84.2, 84.0, 82.2, 84.2]
+    aaa_highs = np.maximum(aaa_opens, aaa_closes) + 0.5
+    aaa_lows = np.minimum(aaa_opens, aaa_closes) - 0.5
+    aaa_highs[-6:] = [97.5, 86.5, 87.5, 84.9, 83.5, 85.5]
+    aaa_lows[-6:] = [95.5, 79.0, 83.8, 83.8, 81.8, 83.7]
 
     bbb_closes = 100 + 10 * np.sin(x)
     bbb_closes[-5:] = [92.0, 90.0, 89.0, 90.0, 91.0]
@@ -85,7 +89,7 @@ def make_signal_research_panel() -> tuple[pd.DataFrame, pd.Timestamp, pd.Timesta
 
     panel = pd.concat(
         [
-            make_stock_frame("AAA", aaa_closes, dates=dates, open_values=aaa_opens),
+            make_stock_frame("AAA", aaa_closes, dates=dates, open_values=aaa_opens, high_values=aaa_highs, low_values=aaa_lows),
             make_stock_frame("BBB", bbb_closes, dates=dates, open_values=bbb_opens),
             make_stock_frame(
                 "FLAT",
@@ -98,7 +102,125 @@ def make_signal_research_panel() -> tuple[pd.DataFrame, pd.Timestamp, pd.Timesta
         ],
         ignore_index=True,
     )
-    return panel, dates[125], dates[126]
+    return panel, dates[126], dates[127]
+
+
+def make_price_action_feature_panel() -> tuple[pd.DataFrame, pd.Timestamp]:
+    dates = pd.date_range("2025-01-01", periods=25, freq="B")
+
+    def build_pattern_frame(
+        ticker: str,
+        closes: list[float],
+        opens: list[float],
+        highs: list[float],
+        lows: list[float],
+    ) -> pd.DataFrame:
+        return make_stock_frame(
+            ticker,
+            closes,
+            dates=dates,
+            open_values=opens,
+            high_values=highs,
+            low_values=lows,
+        )
+
+    base_closes = [
+        100.0,
+        104.0,
+        108.0,
+        106.0,
+        102.0,
+        98.0,
+        94.0,
+        92.0,
+        96.0,
+        100.0,
+        104.0,
+        108.0,
+        106.0,
+        102.0,
+        98.0,
+        91.0,
+        95.0,
+        97.0,
+        99.0,
+        96.0,
+        94.0,
+        92.0,
+        93.0,
+        94.0,
+        95.0,
+    ]
+    base_opens = [value - 0.2 for value in base_closes]
+    base_highs = [value + 1.0 for value in base_closes]
+    base_lows = [value - 1.0 for value in base_closes]
+
+    db_ok_closes = base_closes.copy()
+    db_ok_opens = base_opens.copy()
+    db_ok_highs = base_highs.copy()
+    db_ok_lows = base_lows.copy()
+    db_ok_closes[15:22] = [91.0, 95.0, 97.0, 99.0, 96.0, 94.0, 92.0]
+    db_ok_opens[15:22] = [92.0, 94.0, 96.0, 98.0, 97.0, 95.0, 91.0]
+    db_ok_highs[15:22] = [93.0, 96.0, 98.0, 100.0, 97.0, 95.0, 93.0]
+    db_ok_lows[15:22] = [90.0, 93.0, 95.0, 97.0, 95.0, 93.0, 90.5]
+
+    db_sep_closes = base_closes.copy()
+    db_sep_opens = base_opens.copy()
+    db_sep_highs = base_highs.copy()
+    db_sep_lows = base_lows.copy()
+    db_sep_closes[15:22] = [96.0, 97.0, 98.0, 99.0, 91.0, 95.0, 92.0]
+    db_sep_opens[15:22] = [97.0, 96.0, 97.0, 98.0, 92.0, 94.0, 91.0]
+    db_sep_highs[15:22] = [98.0, 98.0, 99.0, 100.0, 93.0, 96.0, 93.0]
+    db_sep_lows[15:22] = [95.0, 96.0, 97.0, 98.0, 90.0, 93.0, 90.5]
+
+    db_tol_closes = base_closes.copy()
+    db_tol_opens = base_opens.copy()
+    db_tol_highs = base_highs.copy()
+    db_tol_lows = base_lows.copy()
+    db_tol_closes[15:22] = [91.0, 95.0, 97.0, 99.0, 96.0, 94.0, 86.0]
+    db_tol_opens[15:22] = [92.0, 94.0, 96.0, 98.0, 97.0, 95.0, 85.5]
+    db_tol_highs[15:22] = [93.0, 96.0, 98.0, 100.0, 97.0, 95.0, 87.0]
+    db_tol_lows[15:22] = [90.0, 93.0, 95.0, 97.0, 95.0, 93.0, 85.0]
+
+    db_bounce_closes = base_closes.copy()
+    db_bounce_opens = base_opens.copy()
+    db_bounce_highs = base_highs.copy()
+    db_bounce_lows = base_lows.copy()
+    db_bounce_closes[15:22] = [91.0, 91.2, 91.4, 91.6, 91.3, 91.2, 92.0]
+    db_bounce_opens[15:22] = [92.0, 91.0, 91.2, 91.4, 91.1, 91.0, 91.0]
+    db_bounce_highs[15:22] = [93.0, 92.2, 92.3, 92.4, 92.1, 92.0, 93.0]
+    db_bounce_lows[15:22] = [90.0, 90.8, 91.0, 91.2, 90.9, 90.8, 90.5]
+
+    wick_closes = base_closes.copy()
+    wick_opens = base_opens.copy()
+    wick_highs = base_highs.copy()
+    wick_lows = base_lows.copy()
+    wick_closes[20:22] = [85.5, 87.2]
+    wick_opens[20:22] = [86.0, 84.2]
+    wick_highs[20:22] = [86.5, 87.5]
+    wick_lows[20:22] = [79.0, 83.8]
+
+    wick_miss_closes = base_closes.copy()
+    wick_miss_opens = base_opens.copy()
+    wick_miss_highs = base_highs.copy()
+    wick_miss_lows = base_lows.copy()
+    wick_miss_closes[20:22] = [85.5, 85.4]
+    wick_miss_opens[20:22] = [86.0, 84.8]
+    wick_miss_highs[20:22] = [86.5, 85.8]
+    wick_miss_lows[20:22] = [79.0, 84.4]
+
+    panel = pd.concat(
+        [
+            build_pattern_frame("DBOK", db_ok_closes, db_ok_opens, db_ok_highs, db_ok_lows),
+            build_pattern_frame("DBSEP", db_sep_closes, db_sep_opens, db_sep_highs, db_sep_lows),
+            build_pattern_frame("DBTOL", db_tol_closes, db_tol_opens, db_tol_highs, db_tol_lows),
+            build_pattern_frame("DBBNC", db_bounce_closes, db_bounce_opens, db_bounce_highs, db_bounce_lows),
+            build_pattern_frame("WICK", wick_closes, wick_opens, wick_highs, wick_lows),
+            build_pattern_frame("WICKMISS", wick_miss_closes, wick_miss_opens, wick_miss_highs, wick_miss_lows),
+        ],
+        ignore_index=True,
+    )
+    return panel, dates[21]
 
 
 def make_manual_outcome_researcher(
@@ -185,6 +307,38 @@ class BlueChipRangeReversionResearcherTest(unittest.TestCase):
         self.assertAlmostEqual(flat_last["range_width"], 0.0)
         self.assertAlmostEqual(flat_last["zone_position"], 0.5)
 
+    def test_add_features_detects_price_action_patterns_and_rejects_bad_variants(self) -> None:
+        panel, target_date = make_price_action_feature_panel()
+        researcher = BlueChipRangeReversionResearcher(
+            panel,
+            config=RangeStrategyConfig(
+                range_window=10,
+                min_amplitude=0.05,
+                max_amplitude=0.50,
+                max_abs_return_60=1.0,
+                ma_dispersion_window=(3, 5, 8),
+                max_ma_dispersion=1.0,
+                min_lower_touches=1,
+                min_upper_touches=1,
+                double_bottom_lookback=6,
+            ),
+        )
+        researcher.add_features()
+
+        output = researcher.stock_candle_df
+        rows = output[output["date"] == target_date].set_index("ticker")
+
+        self.assertTrue(bool(rows.loc["DBOK", "double_bottom_h2_pattern"]))
+        self.assertFalse(bool(rows.loc["DBSEP", "double_bottom_h2_pattern"]))
+        self.assertFalse(bool(rows.loc["DBTOL", "double_bottom_h2_pattern"]))
+        self.assertFalse(bool(rows.loc["DBBNC", "double_bottom_h2_pattern"]))
+
+        self.assertTrue(bool(rows.loc["WICK", "long_lower_shadow_follow_through_pattern"]))
+        self.assertFalse(bool(rows.loc["WICKMISS", "long_lower_shadow_follow_through_pattern"]))
+        self.assertTrue(bool(rows.loc["DBOK", "price_action_confirmed"]))
+        self.assertTrue(bool(rows.loc["WICK", "price_action_confirmed"]))
+        self.assertFalse(bool(rows.loc["WICKMISS", "price_action_confirmed"]))
+
     def test_add_signals_requires_rebound_confirmation_and_sufficient_upside(self) -> None:
         panel, signal_date, no_rebound_date = make_signal_research_panel()
         researcher = BlueChipRangeReversionResearcher(
@@ -199,13 +353,17 @@ class BlueChipRangeReversionResearcherTest(unittest.TestCase):
         aaa_no_rebound = output[(output["ticker"] == "AAA") & (output["date"] == no_rebound_date)].iloc[0]
 
         self.assertTrue(bool(aaa_signal["range_candidate"]))
+        self.assertTrue(bool(aaa_signal["basic_rebound_confirmed"]))
+        self.assertTrue(bool(aaa_signal["price_action_confirmed"]))
+        self.assertTrue(bool(aaa_signal["long_lower_shadow_follow_through_pattern"]))
         self.assertTrue(bool(aaa_signal["rebound_confirmed"]))
         self.assertTrue(bool(aaa_signal["expected_upside_ok"]))
         self.assertTrue(bool(aaa_signal["entry_signal"]))
         self.assertEqual(aaa_signal["entry_date_next"], signal_date + pd.offsets.BDay(1))
 
         self.assertTrue(bool(bbb_signal["range_candidate"]))
-        self.assertFalse(bool(bbb_signal["expected_upside_ok"]))
+        self.assertFalse(bool(bbb_signal["basic_rebound_confirmed"]))
+        self.assertFalse(bool(bbb_signal["rebound_confirmed"]))
         self.assertFalse(bool(bbb_signal["entry_signal"]))
 
         self.assertTrue(bool(aaa_no_rebound["range_candidate"]))
@@ -215,6 +373,75 @@ class BlueChipRangeReversionResearcherTest(unittest.TestCase):
 
         candidates = researcher.get_candidates(as_of_date=signal_date)
         self.assertEqual(candidates["ticker"].tolist(), ["AAA"])
+
+    def test_add_signals_requires_both_basic_and_price_action_confirmation_unless_disabled(self) -> None:
+        panel, signal_date, _ = make_signal_research_panel()
+        enabled = BlueChipRangeReversionResearcher(
+            panel,
+            config=RangeStrategyConfig(range_window=20, max_ma_dispersion=0.2, enable_price_action_confirmation=True),
+        )
+        enabled_prepared = enabled.stock_candle_df.copy()
+        enabled_mask = (enabled_prepared["ticker"] == "AAA") & (enabled_prepared["date"] == signal_date)
+        enabled_prepared.loc[enabled_mask, "range_candidate"] = True
+        enabled_prepared.loc[enabled_mask, "zone_position"] = 0.10
+        enabled_prepared.loc[enabled_mask, "expected_upside_to_upper"] = 0.25
+        enabled_prepared.loc[enabled_mask, "rebound_confirm_count"] = 2
+        enabled_prepared.loc[enabled_mask, "price_action_confirmed"] = False
+        enabled_prepared.loc[enabled_mask, "double_bottom_h2_pattern"] = False
+        enabled_prepared.loc[enabled_mask, "long_lower_shadow_follow_through_pattern"] = False
+        enabled.stock_candle_df = enabled_prepared
+        enabled.add_features = lambda: enabled.stock_candle_df
+        enabled.add_signals()
+
+        enabled_row = enabled.stock_candle_df.loc[enabled_mask].iloc[0]
+        self.assertTrue(bool(enabled_row["basic_rebound_confirmed"]))
+        self.assertFalse(bool(enabled_row["rebound_confirmed"]))
+        self.assertFalse(bool(enabled_row["entry_signal"]))
+
+        disabled = BlueChipRangeReversionResearcher(
+            panel,
+            config=RangeStrategyConfig(range_window=20, max_ma_dispersion=0.2, enable_price_action_confirmation=False),
+        )
+        disabled_prepared = disabled.stock_candle_df.copy()
+        disabled_mask = (disabled_prepared["ticker"] == "AAA") & (disabled_prepared["date"] == signal_date)
+        disabled_prepared.loc[disabled_mask, "range_candidate"] = True
+        disabled_prepared.loc[disabled_mask, "zone_position"] = 0.10
+        disabled_prepared.loc[disabled_mask, "expected_upside_to_upper"] = 0.25
+        disabled_prepared.loc[disabled_mask, "rebound_confirm_count"] = 2
+        disabled_prepared.loc[disabled_mask, "price_action_confirmed"] = False
+        disabled_prepared.loc[disabled_mask, "double_bottom_h2_pattern"] = False
+        disabled_prepared.loc[disabled_mask, "long_lower_shadow_follow_through_pattern"] = False
+        disabled.stock_candle_df = disabled_prepared
+        disabled.add_features = lambda: disabled.stock_candle_df
+        disabled.add_signals()
+
+        disabled_row = disabled.stock_candle_df.loc[disabled_mask].iloc[0]
+        self.assertTrue(bool(disabled_row["basic_rebound_confirmed"]))
+        self.assertTrue(bool(disabled_row["rebound_confirmed"]))
+        self.assertTrue(bool(disabled_row["entry_signal"]))
+
+        missing_basic = BlueChipRangeReversionResearcher(
+            panel,
+            config=RangeStrategyConfig(range_window=20, max_ma_dispersion=0.2, enable_price_action_confirmation=True),
+        )
+        missing_basic_prepared = missing_basic.stock_candle_df.copy()
+        missing_basic_mask = (missing_basic_prepared["ticker"] == "AAA") & (missing_basic_prepared["date"] == signal_date)
+        missing_basic_prepared.loc[missing_basic_mask, "range_candidate"] = True
+        missing_basic_prepared.loc[missing_basic_mask, "zone_position"] = 0.10
+        missing_basic_prepared.loc[missing_basic_mask, "expected_upside_to_upper"] = 0.25
+        missing_basic_prepared.loc[missing_basic_mask, "rebound_confirm_count"] = 1
+        missing_basic_prepared.loc[missing_basic_mask, "price_action_confirmed"] = True
+        missing_basic_prepared.loc[missing_basic_mask, "double_bottom_h2_pattern"] = True
+        missing_basic_prepared.loc[missing_basic_mask, "long_lower_shadow_follow_through_pattern"] = False
+        missing_basic.stock_candle_df = missing_basic_prepared
+        missing_basic.add_features = lambda: missing_basic.stock_candle_df
+        missing_basic.add_signals()
+
+        missing_basic_row = missing_basic.stock_candle_df.loc[missing_basic_mask].iloc[0]
+        self.assertFalse(bool(missing_basic_row["basic_rebound_confirmed"]))
+        self.assertTrue(bool(missing_basic_row["price_action_confirmed"]))
+        self.assertFalse(bool(missing_basic_row["rebound_confirmed"]))
+        self.assertFalse(bool(missing_basic_row["entry_signal"]))
 
     def test_add_research_outcomes_handles_exit_paths_and_suppresses_reentries(self) -> None:
         researcher = make_manual_outcome_researcher()
@@ -423,7 +650,11 @@ class BlueChipRangeReversionResearcherTest(unittest.TestCase):
         self.assertEqual(inspection["summary"]["signal_date"], signal_date)
         self.assertTrue(inspection["summary"]["raw_signal"])
         self.assertTrue(inspection["summary"]["executed_signal"])
+        self.assertTrue(inspection["summary"]["price_action_confirmed"])
+        self.assertIn("Long Lower Shadow + Follow-Through", inspection["summary"]["price_action_labels"])
         self.assertEqual(inspection["signal_row"]["ticker"].iat[0], "AAA")
+        self.assertIn("price_action_confirmed", inspection["signal_row"].columns.tolist())
+        self.assertIn("double_bottom_h2_pattern", inspection["condition_checklist"]["condition"].tolist())
         self.assertIn("entry_signal", inspection["condition_checklist"]["condition"].tolist())
         self.assertFalse(inspection["price_window"].empty)
         self.assertEqual(
@@ -434,6 +665,9 @@ class BlueChipRangeReversionResearcherTest(unittest.TestCase):
         figure = researcher.plot_signal_context("AAA", signal_date, lookback=5, lookahead=3)
         self.assertIsInstance(figure, go.Figure)
         self.assertGreaterEqual(len(figure.data), 4)
+        self.assertTrue(
+            any("Price Action" in getattr(annotation, "text", "") for annotation in figure.layout.annotations)
+        )
         self.assertTrue(any("open_position" in getattr(annotation, "text", "") for annotation in figure.layout.annotations))
 
         closed_researcher = make_manual_outcome_researcher()
