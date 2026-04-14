@@ -99,3 +99,6 @@ db.sqlite3-journal
 .python-version
 cython_debug/
 Dataframes/
+
+# CSV
+*.csv

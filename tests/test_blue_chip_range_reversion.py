@@ -189,7 +189,7 @@ class BlueChipRangeReversionResearcherTest(unittest.TestCase):
         panel, signal_date, no_rebound_date = make_signal_research_panel()
         researcher = BlueChipRangeReversionResearcher(
             panel,
-            config=RangeStrategyConfig(range_window=20, max_ma_dispersion=0.2),
+            config=RangeStrategyConfig(range_window=20, max_ma_dispersion=0.2, min_return_60=-0.2),
         )
         researcher.add_signals()
 
@@ -225,7 +225,7 @@ class BlueChipRangeReversionResearcherTest(unittest.TestCase):
         panel, signal_date, _ = make_signal_research_panel()
         baseline = BlueChipRangeReversionResearcher(
             panel,
-            config=RangeStrategyConfig(range_window=20, max_ma_dispersion=0.2),
+            config=RangeStrategyConfig(range_window=20, max_ma_dispersion=0.2, min_return_60=-0.2),
         )
         baseline.add_signals()
         baseline_output = baseline.stock_candle_df
@@ -248,6 +248,27 @@ class BlueChipRangeReversionResearcherTest(unittest.TestCase):
 
         self.assertLess(float(aaa_signal["ret_60d"]), 0.0)
         self.assertFalse(bool(aaa_signal["range_candidate"]))
+
+    def test_get_next_session_candidates_supports_latest_completed_bar(self) -> None:
+        panel, _, _ = make_signal_research_panel()
+        researcher = BlueChipRangeReversionResearcher(
+            panel,
+            config=RangeStrategyConfig(range_window=20, max_ma_dispersion=0.2, min_return_60=-0.2),
+        )
+
+        latest_date = panel["date"].max()
+        next_trade_date = latest_date + pd.offsets.BDay(1)
+        candidates = researcher.get_next_session_candidates(
+            as_of_date=latest_date,
+            next_trade_date=next_trade_date,
+        )
+
+        self.assertEqual(candidates["ticker"].tolist(), ["AAA", "BBB"])
+        self.assertTrue(candidates["entry_signal_live"].all())
+        self.assertTrue(candidates["planned_entry_date"].eq(next_trade_date).all())
+        self.assertTrue(candidates["entry_reference_price"].gt(0).all())
+        self.assertTrue(candidates["planned_hard_stop_price"].lt(candidates["entry_reference_price"]).all())
+        self.assertTrue(candidates["planned_take_profit_price"].gt(candidates["entry_reference_price"]).all())
 
     def test_add_research_outcomes_handles_exit_paths_and_suppresses_reentries(self) -> None:
         researcher = make_manual_outcome_researcher()
@@ -408,6 +429,36 @@ class BlueChipRangeReversionResearcherTest(unittest.TestCase):
         self.assertEqual(trade_df.attrs["open_trade_count"], 1)
         self.assertEqual(trade_df.attrs["open_trade_tickers"], ["OPEN"])
 
+    def test_monitor_positions_flags_next_open_exit_and_overdue_exit(self) -> None:
+        researcher = make_manual_outcome_researcher()
+        dates = pd.date_range("2025-01-01", periods=5, freq="B")
+        positions = pd.DataFrame(
+            [
+                {"ticker": "AAA", "entry_date": dates[1], "entry_price": 100.0, "shares": 200},
+                {"ticker": "DDD", "entry_date": dates[1], "entry_price": 100.0},
+            ]
+        )
+
+        same_day_alerts = researcher.monitor_positions(
+            positions.iloc[[0]],
+            as_of_date=dates[2],
+            next_trade_date=dates[3],
+        )
+        self.assertEqual(same_day_alerts.loc[0, "action"], "exit_next_open")
+        self.assertEqual(same_day_alerts.loc[0, "exit_reason"], "hard_stop")
+        self.assertEqual(same_day_alerts.loc[0, "planned_exit_date"], dates[3])
+        self.assertAlmostEqual(float(same_day_alerts.loc[0, "pnl_amount"]), -2200.0)
+
+        overdue_alerts = researcher.monitor_positions(
+            positions.iloc[[1]],
+            as_of_date=dates[4],
+            next_trade_date=dates[4] + pd.offsets.BDay(1),
+        )
+        self.assertEqual(overdue_alerts.loc[0, "action"], "exit_overdue")
+        self.assertEqual(overdue_alerts.loc[0, "exit_reason"], "time_stop")
+        self.assertEqual(overdue_alerts.loc[0, "planned_exit_date"], dates[3])
+        self.assertEqual(int(overdue_alerts.loc[0, "days_until_time_stop"]), 0)
+
     def test_analyze_feature_win_rates_identifies_best_and_worst_feature_ranges(self) -> None:
         researcher = make_manual_outcome_researcher()
         researcher.trade_df = pd.DataFrame(
@@ -471,7 +522,7 @@ class BlueChipRangeReversionResearcherTest(unittest.TestCase):
         panel, signal_date, _ = make_signal_research_panel()
         researcher = BlueChipRangeReversionResearcher(
             panel,
-            config=RangeStrategyConfig(range_window=20, max_ma_dispersion=0.2),
+            config=RangeStrategyConfig(range_window=20, max_ma_dispersion=0.2, min_return_60=-0.2),
         )
 
         self.assertIn("exit_reason", researcher.stock_candle_df.columns)

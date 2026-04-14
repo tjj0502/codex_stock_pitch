@@ -172,6 +172,85 @@ def get_hs300_constituents(
     )
 
 
+def get_trade_calendar(
+    token: str | None = None,
+    start_date: DateLike | None = None,
+    end_date: DateLike | None = None,
+    *,
+    exchange: str = "SSE",
+    is_open: int | None = 1,
+) -> pd.DataFrame:
+    """
+    Fetch the Chinese trading calendar from Tushare.
+
+    Parameters
+    ----------
+    token:
+        Optional Tushare token. Falls back to ``TUSHARE_TOKEN``.
+    start_date, end_date:
+        Date range to query. Defaults to the last 31 calendar days ending
+        today if omitted.
+    exchange:
+        Exchange code passed to Tushare ``trade_cal``. ``"SSE"`` is a sensible
+        default for mainland A-share workflows.
+    is_open:
+        When set to ``1`` or ``0``, keep only open or closed dates
+        respectively. Pass ``None`` to keep all calendar rows.
+    """
+    client = _get_tushare_client(token=token)
+    resolved_end = _normalize_date(end_date or pd.Timestamp.today().date())
+    resolved_start = _normalize_date(
+        start_date or (pd.Timestamp(resolved_end) - pd.Timedelta(days=31))
+    )
+    calendar = client.trade_cal(
+        exchange=exchange,
+        start_date=resolved_start,
+        end_date=resolved_end,
+    )
+    if calendar.empty:
+        return calendar
+
+    calendar = calendar.copy()
+    calendar["cal_date"] = pd.to_datetime(calendar["cal_date"], format="%Y%m%d")
+    if "pretrade_date" in calendar.columns:
+        calendar["pretrade_date"] = pd.to_datetime(calendar["pretrade_date"], format="%Y%m%d", errors="coerce")
+    if is_open is not None:
+        calendar = calendar[calendar["is_open"].eq(int(is_open))].copy()
+    return calendar.sort_values("cal_date", kind="mergesort", ignore_index=True)
+
+
+def get_next_trading_day(
+    value: DateLike,
+    token: str | None = None,
+    *,
+    exchange: str = "SSE",
+    lookahead_days: int = 20,
+) -> pd.Timestamp:
+    """
+    Return the next open trading day after ``value``.
+
+    ``lookahead_days`` is a simple safety window for holiday stretches.
+    """
+    if lookahead_days < 1:
+        raise ValueError("lookahead_days must be at least 1.")
+
+    current_day = pd.Timestamp(value).normalize()
+    search_start = current_day + pd.Timedelta(days=1)
+    search_end = current_day + pd.Timedelta(days=lookahead_days)
+    calendar = get_trade_calendar(
+        token=token,
+        start_date=search_start,
+        end_date=search_end,
+        exchange=exchange,
+        is_open=1,
+    )
+    if calendar.empty:
+        raise ValueError(
+            f"No open trading day found between {search_start.date()} and {search_end.date()}."
+        )
+    return pd.Timestamp(calendar["cal_date"].iloc[0]).normalize()
+
+
 def get_index_member_prices(
     index_code: str,
     sd: DateLike,

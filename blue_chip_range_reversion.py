@@ -1081,6 +1081,417 @@ class BlueChipRangeReversionResearcher:
         selected_columns = [column for column in columns + optional_columns if column in candidates.columns]
         return candidates.loc[:, selected_columns].reset_index(drop=True)
 
+    def get_next_session_candidates(
+        self,
+        as_of_date: str | pd.Timestamp | None = None,
+        *,
+        next_trade_date: str | pd.Timestamp | None = None,
+        entry_price_basis: str = "close",
+    ) -> pd.DataFrame:
+        """
+        Return live candidates for the next session using the latest completed bar.
+
+        Unlike ``get_candidates()``, this helper does not require known ``t+1``
+        data. It evaluates the close-of-day rule set on ``as_of_date`` and uses
+        ``entry_price_basis`` only as a planning reference for stop/target
+        levels shown in the output.
+        """
+        if entry_price_basis not in {"close", "open"}:
+            raise ValueError("entry_price_basis must be either 'close' or 'open'.")
+
+        self.add_features()
+        cfg = self.config
+        df = self._sort_for_calculation(self.stock_candle_df.copy())
+        if df.empty:
+            return pd.DataFrame(
+                columns=[
+                    "signal_date",
+                    "planned_entry_date",
+                    "ticker",
+                    "ts_code",
+                    "name",
+                    "entry_price_basis",
+                    "entry_reference_price",
+                    "planned_hard_stop_price",
+                    "planned_take_profit_price",
+                    "range_upper",
+                    "range_lower",
+                    "range_mid",
+                    "range_amplitude",
+                    "zone_position",
+                    "expected_upside_to_upper",
+                    "expected_upside_ok",
+                    "close_gt_open",
+                    "close_gt_prev_high",
+                    "close_gt_sma_5",
+                    "inside_bar",
+                    "outside_bar",
+                    "not_inside_bar",
+                    "rebound_confirm_count",
+                    "rebound_confirmed",
+                    "entry_zone_ok",
+                    "entry_signal_live",
+                ]
+            )
+
+        target_date = pd.to_datetime(as_of_date) if as_of_date is not None else df["date"].max()
+        planned_entry_date = pd.to_datetime(next_trade_date) if next_trade_date is not None else target_date + pd.offsets.BDay(1)
+
+        df["entry_zone_ok"] = df["zone_position"].le(cfg.entry_zone_threshold)
+        df["expected_upside_ok"] = df["expected_upside_to_upper"].ge(cfg.stop_loss_pct * cfg.take_profit_r_multiple)
+        df["rebound_confirmed"] = (
+            df["close_gt_open"]
+            & df["not_inside_bar"]
+            & df["rebound_confirm_count"].eq(1)
+        )
+        df["entry_signal_live"] = (
+            df["range_candidate"]
+            & df["entry_zone_ok"]
+            & df["expected_upside_ok"]
+            & df["rebound_confirmed"]
+            & df[entry_price_basis].gt(0)
+        )
+
+        candidates = df[df["date"].eq(target_date) & df["entry_signal_live"]].copy()
+        if candidates.empty:
+            return candidates.reindex(
+                columns=[
+                    "signal_date",
+                    "planned_entry_date",
+                    "ticker",
+                    "ts_code",
+                    "name",
+                    "entry_price_basis",
+                    "entry_reference_price",
+                    "planned_hard_stop_price",
+                    "planned_take_profit_price",
+                    "range_upper",
+                    "range_lower",
+                    "range_mid",
+                    "range_amplitude",
+                    "zone_position",
+                    "expected_upside_to_upper",
+                    "expected_upside_ok",
+                    "close_gt_open",
+                    "close_gt_prev_high",
+                    "close_gt_sma_5",
+                    "inside_bar",
+                    "outside_bar",
+                    "not_inside_bar",
+                    "rebound_confirm_count",
+                    "rebound_confirmed",
+                    "entry_zone_ok",
+                    "entry_signal_live",
+                ]
+            ).reset_index(drop=True)
+
+        candidates["signal_date"] = candidates["date"]
+        candidates["planned_entry_date"] = planned_entry_date
+        candidates["entry_price_basis"] = entry_price_basis
+        candidates["entry_reference_price"] = candidates[entry_price_basis]
+        candidates["planned_hard_stop_price"] = candidates["entry_reference_price"] * (1.0 - cfg.stop_loss_pct)
+        candidates["planned_take_profit_price"] = np.minimum(
+            candidates["range_upper"],
+            candidates["entry_reference_price"] * (1.0 + cfg.stop_loss_pct * cfg.take_profit_r_multiple),
+        )
+        candidates = candidates.sort_values(
+            ["expected_upside_to_upper", "zone_position", "ticker"],
+            ascending=[False, True, True],
+            kind="mergesort",
+            ignore_index=True,
+        )
+
+        columns = [
+            "signal_date",
+            "planned_entry_date",
+            "ticker",
+            "ts_code",
+            "name",
+            "entry_price_basis",
+            "entry_reference_price",
+            "planned_hard_stop_price",
+            "planned_take_profit_price",
+            "range_upper",
+            "range_lower",
+            "range_mid",
+            "range_amplitude",
+            "zone_position",
+            "expected_upside_to_upper",
+            "expected_upside_ok",
+            "close_gt_open",
+            "close_gt_prev_high",
+            "close_gt_sma_5",
+            "inside_bar",
+            "outside_bar",
+            "not_inside_bar",
+            "rebound_confirm_count",
+            "rebound_confirmed",
+            "entry_zone_ok",
+            "entry_signal_live",
+        ]
+        return candidates.loc[:, columns].reset_index(drop=True)
+
+    def monitor_positions(
+        self,
+        positions_df: pd.DataFrame,
+        as_of_date: str | pd.Timestamp | None = None,
+        *,
+        next_trade_date: str | pd.Timestamp | None = None,
+    ) -> pd.DataFrame:
+        """
+        Evaluate currently-held positions against the strategy's exit rules.
+
+        Required columns in ``positions_df``:
+        - ``ticker``
+        - ``entry_date``
+        - ``entry_price``
+
+        Optional columns:
+        - ``signal_date``: if omitted, the method assumes the signal was the
+          previous trading day before ``entry_date``.
+        - ``shares`` and any other custom columns are carried into the output.
+        """
+        if not isinstance(positions_df, pd.DataFrame):
+            raise TypeError("positions_df must be a pandas DataFrame.")
+
+        required_columns = ["ticker", "entry_date", "entry_price"]
+        missing = [column for column in required_columns if column not in positions_df.columns]
+        if missing:
+            raise ValueError(f"positions_df is missing required columns: {missing}")
+
+        computed_columns = [
+            "name",
+            "as_of_date",
+            "latest_bar_date",
+            "signal_date_resolved",
+            "signal_range_upper",
+            "latest_range_lower",
+            "latest_range_upper",
+            "latest_zone_position",
+            "current_close",
+            "pnl_pct",
+            "pnl_amount",
+            "holding_days",
+            "trading_days_in_trade",
+            "days_until_time_stop",
+            "hard_stop_price",
+            "take_profit_price",
+            "breakdown_streak",
+            "exit_signal",
+            "exit_signal_date",
+            "planned_exit_date",
+            "exit_reason",
+            "action",
+            "issue",
+        ]
+        output_columns = list(dict.fromkeys(list(positions_df.columns) + computed_columns))
+
+        self.add_features()
+        scored = self._sort_for_calculation(self.stock_candle_df.copy())
+        if scored.empty:
+            return pd.DataFrame(columns=output_columns)
+
+        cfg = self.config
+        target_date = pd.to_datetime(as_of_date) if as_of_date is not None else scored["date"].max()
+        resolved_next_trade_date = (
+            pd.to_datetime(next_trade_date) if next_trade_date is not None else target_date + pd.offsets.BDay(1)
+        )
+
+        positions = positions_df.copy()
+        positions["ticker"] = positions["ticker"].astype("string")
+        positions["entry_date"] = pd.to_datetime(positions["entry_date"])
+        positions["entry_price"] = pd.to_numeric(positions["entry_price"], errors="coerce")
+        if "signal_date" in positions.columns:
+            positions["signal_date"] = pd.to_datetime(positions["signal_date"], errors="coerce")
+        if "shares" in positions.columns:
+            positions["shares"] = pd.to_numeric(positions["shares"], errors="coerce")
+
+        records: list[dict[str, object]] = []
+        scored["ticker"] = scored["ticker"].astype("string")
+
+        for _, position in positions.iterrows():
+            ticker = str(position["ticker"])
+            entry_date = pd.to_datetime(position["entry_date"])
+            entry_price = float(position["entry_price"]) if pd.notna(position["entry_price"]) else np.nan
+            ticker_frame = scored[
+                scored["ticker"].eq(ticker) & scored["date"].le(target_date)
+            ].reset_index(drop=True)
+
+            record = {column: position[column] if column in position.index else pd.NA for column in positions.columns}
+            record.update(
+                {
+                    "name": pd.NA,
+                    "as_of_date": target_date,
+                    "latest_bar_date": pd.NaT,
+                    "signal_date_resolved": pd.NaT,
+                    "signal_range_upper": np.nan,
+                    "latest_range_lower": np.nan,
+                    "latest_range_upper": np.nan,
+                    "latest_zone_position": np.nan,
+                    "current_close": np.nan,
+                    "pnl_pct": np.nan,
+                    "pnl_amount": np.nan,
+                    "holding_days": pd.NA,
+                    "trading_days_in_trade": pd.NA,
+                    "days_until_time_stop": pd.NA,
+                    "hard_stop_price": np.nan,
+                    "take_profit_price": np.nan,
+                    "breakdown_streak": 0,
+                    "exit_signal": False,
+                    "exit_signal_date": pd.NaT,
+                    "planned_exit_date": pd.NaT,
+                    "exit_reason": pd.NA,
+                    "action": "data_issue",
+                    "issue": pd.NA,
+                }
+            )
+
+            if ticker_frame.empty:
+                record["issue"] = "ticker is not present in the price data on or before as_of_date"
+                records.append(record)
+                continue
+
+            latest_row = ticker_frame.iloc[-1]
+            record["name"] = latest_row["name"]
+            record["latest_bar_date"] = latest_row["date"]
+            record["latest_range_lower"] = float(latest_row["range_lower"]) if pd.notna(latest_row["range_lower"]) else np.nan
+            record["latest_range_upper"] = float(latest_row["range_upper"]) if pd.notna(latest_row["range_upper"]) else np.nan
+            record["latest_zone_position"] = (
+                float(latest_row["zone_position"]) if pd.notna(latest_row["zone_position"]) else np.nan
+            )
+            record["current_close"] = float(latest_row["close"]) if pd.notna(latest_row["close"]) else np.nan
+
+            if pd.isna(entry_price) or entry_price <= 0:
+                record["issue"] = "entry_price must be a positive number"
+                records.append(record)
+                continue
+
+            if entry_date > latest_row["date"]:
+                record["issue"] = "entry_date is after the latest available bar"
+                records.append(record)
+                continue
+
+            entry_matches = ticker_frame.index[ticker_frame["date"].eq(entry_date)]
+            if len(entry_matches) == 0:
+                record["issue"] = "entry_date does not match a trading day for this ticker"
+                records.append(record)
+                continue
+
+            entry_loc = int(entry_matches[0])
+            signal_date = position["signal_date"] if "signal_date" in position.index else pd.NaT
+            if pd.notna(signal_date):
+                signal_matches = ticker_frame.index[ticker_frame["date"].eq(pd.to_datetime(signal_date))]
+                if len(signal_matches) == 0:
+                    record["issue"] = "signal_date is not available in the price data"
+                    records.append(record)
+                    continue
+                signal_loc = int(signal_matches[0])
+            else:
+                signal_loc = entry_loc - 1
+
+            if signal_loc < 0 or signal_loc >= entry_loc:
+                record["issue"] = "unable to resolve a valid signal row before entry_date"
+                records.append(record)
+                continue
+
+            signal_row = ticker_frame.iloc[signal_loc]
+            current_loc = len(ticker_frame) - 1
+            record["signal_date_resolved"] = signal_row["date"]
+            record["signal_range_upper"] = float(signal_row["range_upper"]) if pd.notna(signal_row["range_upper"]) else np.nan
+            record["holding_days"] = int(current_loc - entry_loc)
+            record["trading_days_in_trade"] = int(current_loc - entry_loc + 1)
+            record["days_until_time_stop"] = max(cfg.max_holding_days - int(record["trading_days_in_trade"]), 0)
+            if pd.notna(record["current_close"]) and entry_price > 0:
+                record["pnl_pct"] = float(record["current_close"] / entry_price - 1.0)
+                if "shares" in position.index and pd.notna(position["shares"]):
+                    record["pnl_amount"] = float(float(position["shares"]) * (record["current_close"] - entry_price))
+
+            hard_stop_price = entry_price * (1.0 - cfg.stop_loss_pct)
+            take_profit_cap = entry_price * (1.0 + cfg.stop_loss_pct * cfg.take_profit_r_multiple)
+            take_profit_price = np.minimum(signal_row["range_upper"], take_profit_cap)
+            record["hard_stop_price"] = hard_stop_price if cfg.enable_hard_stop else np.nan
+            record["take_profit_price"] = take_profit_price if cfg.enable_take_profit else np.nan
+
+            breakdown_streak = 0
+            exit_signal_loc: int | None = None
+            exit_reason: str | None = None
+            for eval_loc in range(entry_loc, current_loc + 1):
+                eval_row = ticker_frame.iloc[eval_loc]
+                close_price = eval_row["close"]
+                lower_band = eval_row["range_lower"]
+
+                if (
+                    cfg.enable_hard_stop
+                    and pd.notna(close_price)
+                    and pd.notna(hard_stop_price)
+                    and close_price <= hard_stop_price
+                ):
+                    exit_signal_loc = eval_loc
+                    exit_reason = "hard_stop"
+                    break
+
+                if (
+                    cfg.enable_breakdown_stop
+                    and pd.notna(close_price)
+                    and pd.notna(lower_band)
+                    and close_price <= lower_band * (1.0 - cfg.breakdown_buffer)
+                ):
+                    breakdown_streak += 1
+                else:
+                    breakdown_streak = 0
+
+                if cfg.enable_breakdown_stop and breakdown_streak >= cfg.breakdown_confirm_days:
+                    exit_signal_loc = eval_loc
+                    exit_reason = "breakdown_stop"
+                    break
+
+                if (
+                    cfg.enable_take_profit
+                    and pd.notna(close_price)
+                    and pd.notna(take_profit_price)
+                    and close_price >= take_profit_price
+                ):
+                    exit_signal_loc = eval_loc
+                    exit_reason = "take_profit"
+                    break
+
+                if cfg.enable_time_stop and eval_loc - entry_loc + 1 >= cfg.max_holding_days:
+                    exit_signal_loc = eval_loc
+                    exit_reason = "time_stop"
+                    break
+
+            record["breakdown_streak"] = breakdown_streak
+            if exit_reason is None:
+                record["action"] = "hold"
+                records.append(record)
+                continue
+
+            record["exit_signal"] = True
+            record["exit_signal_date"] = ticker_frame.iloc[exit_signal_loc]["date"] if exit_signal_loc is not None else pd.NaT
+            record["exit_reason"] = exit_reason
+            if exit_signal_loc is not None and exit_signal_loc < current_loc:
+                record["planned_exit_date"] = ticker_frame.iloc[exit_signal_loc + 1]["date"]
+                record["action"] = "exit_overdue"
+            else:
+                record["planned_exit_date"] = resolved_next_trade_date
+                record["action"] = "exit_next_open"
+
+            records.append(record)
+
+        monitored = pd.DataFrame(records)
+        if monitored.empty:
+            return pd.DataFrame(columns=output_columns)
+
+        action_priority = {"exit_overdue": 0, "exit_next_open": 1, "hold": 2, "data_issue": 3}
+        monitored["_action_priority"] = monitored["action"].map(action_priority).fillna(99)
+        monitored = monitored.sort_values(
+            ["_action_priority", "ticker"],
+            ascending=[True, True],
+            kind="mergesort",
+            ignore_index=True,
+        ).drop(columns="_action_priority")
+        return monitored.reindex(columns=output_columns)
+
     def inspect_signal(
         self,
         ticker: str,

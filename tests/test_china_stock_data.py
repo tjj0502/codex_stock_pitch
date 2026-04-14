@@ -116,6 +116,51 @@ class IndexDataFetchTest(unittest.TestCase):
             end_date="20250331",
         )
 
+    @patch("china_stock_data._get_tushare_client")
+    def test_get_trade_calendar_normalizes_dates_and_filters_open_days(
+        self,
+        mock_get_client: MagicMock,
+    ) -> None:
+        mock_client = MagicMock()
+        mock_client.trade_cal.return_value = pd.DataFrame(
+            [
+                {"exchange": "SSE", "cal_date": "20250403", "is_open": 1, "pretrade_date": "20250402"},
+                {"exchange": "SSE", "cal_date": "20250404", "is_open": 0, "pretrade_date": "20250403"},
+                {"exchange": "SSE", "cal_date": "20250407", "is_open": 1, "pretrade_date": "20250403"},
+            ]
+        )
+        mock_get_client.return_value = mock_client
+
+        result = china_stock_data.get_trade_calendar(
+            start_date="2025-04-03",
+            end_date="2025-04-07",
+        )
+
+        self.assertEqual(result["cal_date"].dt.strftime("%Y-%m-%d").tolist(), ["2025-04-03", "2025-04-07"])
+        self.assertTrue(result["is_open"].eq(1).all())
+        mock_client.trade_cal.assert_called_once_with(
+            exchange="SSE",
+            start_date="20250403",
+            end_date="20250407",
+        )
+
+    @patch("china_stock_data.get_trade_calendar")
+    def test_get_next_trading_day_returns_first_open_date(
+        self,
+        mock_get_trade_calendar: MagicMock,
+    ) -> None:
+        mock_get_trade_calendar.return_value = pd.DataFrame(
+            {
+                "cal_date": pd.to_datetime(["2025-04-07", "2025-04-08"]),
+                "is_open": [1, 1],
+            }
+        )
+
+        result = china_stock_data.get_next_trading_day("2025-04-03")
+
+        self.assertEqual(result, pd.Timestamp("2025-04-07"))
+        mock_get_trade_calendar.assert_called_once()
+
     @patch("china_stock_data.ts.pro_bar")
     @patch("china_stock_data._get_tushare_client")
     @patch("china_stock_data.get_index_constituents")
