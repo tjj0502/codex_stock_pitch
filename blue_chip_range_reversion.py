@@ -53,12 +53,13 @@ class RangeStrategyConfig:
 
     universe: str = "csi500"
     # Calculate the range
-    range_window: int = 120
+    range_window: int = 20
     upper_quantile: float = 0.9
     lower_quantile: float = 0.1
     min_amplitude: float = 0.20
     max_amplitude: float = 0.45
-    max_abs_return_60: float = 0.15
+    min_return_60: float = 0.
+    max_abs_return_60: float = 0.1
     ma_dispersion_window: tuple[int, int, int] = (20, 60, 120)
     max_ma_dispersion: float = 0.08
     touch_zone_pct: float = 0.20
@@ -86,6 +87,8 @@ class RangeStrategyConfig:
             raise ValueError("lower_quantile and upper_quantile must satisfy 0 < lower < upper < 1.")
         if self.min_amplitude < 0 or self.max_amplitude <= self.min_amplitude:
             raise ValueError("min_amplitude must be non-negative and smaller than max_amplitude.")
+        if self.min_return_60 > self.max_abs_return_60:
+            raise ValueError("min_return_60 must be smaller than or equal to max_abs_return_60.")
         if len(self.ma_dispersion_window) != 3 or any(window < 2 for window in self.ma_dispersion_window):
             raise ValueError("ma_dispersion_window must contain exactly three integers >= 2.")
         if self.max_ma_dispersion <= 0:
@@ -155,8 +158,11 @@ class BlueChipRangeReversionResearcher:
         "upper_touch_count",
         "expected_upside_to_upper",
         "close_gt_open",
-        "close_gt_prev_close",
+        "close_gt_prev_high",
         "close_gt_sma_5",
+        "inside_bar",
+        "outside_bar",
+        "not_inside_bar",
         "rebound_confirm_count",
         "range_candidate",
     ]
@@ -353,7 +359,7 @@ class BlueChipRangeReversionResearcher:
         - trend sanity checks: 60-day return and moving-average dispersion
         - range description: rolling upper/lower quantiles plus zone position
         - range quality: repeated lower/upper touches inside the lookback window
-        - entry confirmation: simple price-action rebound checks
+        - entry confirmation: a stricter candle-structure rebound filter
         """
         cfg = self.config
         df = self._sort_for_calculation(self.stock_candle_df)
@@ -409,18 +415,27 @@ class BlueChipRangeReversionResearcher:
         df["expected_upside_to_upper"] = self._safe_ratio(df["range_upper"] - df["close"], df["close"]).replace(
             [np.inf, -np.inf], np.nan
         )
+        previous_high = ticker_group["high"].shift(1)
+        previous_low = ticker_group["low"].shift(1)
         df["close_gt_open"] = df["close"].gt(df["open"])
-        df["close_gt_prev_close"] = df.groupby("ticker", sort=False)["close"].diff().gt(0)
+        df["close_gt_prev_high"] = df["close"].gt(previous_high)
         df["close_gt_sma_5"] = df["close"].gt(df["sma_5"])
+        df["inside_bar"] = df["high"].le(previous_high) & df["low"].ge(previous_low)
+        df["outside_bar"] = df["high"].gt(previous_high) & df["low"].lt(previous_low)
+        df["not_inside_bar"] = ~df["inside_bar"].fillna(False)
+        # Auxiliary confirmation passes either on a true outside bar or on a
+        # tighter momentum combination: close back above the 5-day mean and
+        # above the previous day's high.
         df["rebound_confirm_count"] = (
-            df[["close_gt_open", "close_gt_prev_close", "close_gt_sma_5"]].fillna(False).sum(axis=1).astype(int)
-        )
+            df["outside_bar"].fillna(False)
+            | (df["close_gt_sma_5"].fillna(False) & df["close_gt_prev_high"].fillna(False))
+        ).astype(int)
 
         # ``range_candidate`` is the coarse universe filter. A later signal
         # still needs to be near the lower band and show rebound confirmation.
         ma_complete = df[dispersion_columns].notna().all(axis=1)
         df["range_candidate"] = (
-            df["ret_60d"].abs().le(cfg.max_abs_return_60)
+            df["ret_60d"].between(cfg.min_return_60, cfg.max_abs_return_60, inclusive="both")
             & df["range_amplitude"].between(cfg.min_amplitude, cfg.max_amplitude, inclusive="both")
             & df["ma_dispersion"].le(cfg.max_ma_dispersion)
             & df["lower_touch_count"].ge(cfg.min_lower_touches)
@@ -449,7 +464,18 @@ class BlueChipRangeReversionResearcher:
         df["entry_open_next"] = ticker_group["open"].shift(-1)
         df["entry_zone_ok"] = df["zone_position"].le(cfg.entry_zone_threshold)
         df["expected_upside_ok"] = df["expected_upside_to_upper"].ge(cfg.stop_loss_pct * cfg.take_profit_r_multiple)
-        df["rebound_confirmed"] = df["rebound_confirm_count"].ge(2)
+        # Base rebound rule:
+        # 1. close above open is mandatory
+        # 2. not being an inside bar is mandatory
+        # 3. and at least one of these supportive signs must be present:
+        #    - outside bar
+        #    - close above the 5-day moving average
+        #    - close above the previous day's high
+        df["rebound_confirmed"] = (
+            df["close_gt_open"]
+            & df["not_inside_bar"]
+            & df["rebound_confirm_count"].eq(1)
+        )
         # Take-profit is capped by both the structural upper band and the 2R
         # target implied by the configured stop distance.
         df["signal_take_profit_price"] = np.minimum(
@@ -672,6 +698,69 @@ class BlueChipRangeReversionResearcher:
 
         return self._store_trade_df(trades)
 
+    @staticmethod
+    def _build_feature_bucket_bar_plot(
+        feature_bucket_frame: pd.DataFrame,
+        *,
+        feature: str,
+        rank_col: str,
+        rank_aggfunc: str,
+    ) -> go.Figure:
+        plot_frame = feature_bucket_frame.sort_values(
+            ["bucket_order", "feature_bucket"],
+            kind="mergesort",
+            ignore_index=True,
+        )
+        figure = go.Figure()
+        figure.add_trace(
+            go.Bar(
+                x=plot_frame["feature_bucket"],
+                y=plot_frame["rank_value"],
+                marker=dict(
+                    color=plot_frame["rank_value"],
+                    colorscale="RdYlGn",
+                    colorbar=dict(title=f"{rank_col} ({rank_aggfunc})"),
+                ),
+                customdata=np.column_stack(
+                    [
+                        plot_frame["count"],
+                        plot_frame["win_rate"],
+                        plot_frame["mean_return"],
+                        plot_frame["median_return"],
+                        plot_frame["rank_mean"],
+                        plot_frame["rank_median"],
+                        plot_frame["rank_non_null_count"],
+                    ]
+                ),
+                hovertemplate=(
+                    "Bucket=%{x}<br>"
+                    "Rank Value=%{y:.4f}<br>"
+                    "Count=%{customdata[0]}<br>"
+                    "Win Rate=%{customdata[1]:.2%}<br>"
+                    "Mean Return=%{customdata[2]:.2%}<br>"
+                    "Median Return=%{customdata[3]:.2%}<br>"
+                    f"{rank_col} Mean=%{{customdata[4]:.4f}}<br>"
+                    f"{rank_col} Median=%{{customdata[5]:.4f}}<br>"
+                    "Rank Non-Null=%{customdata[6]}<extra></extra>"
+                ),
+                text=plot_frame["count"].astype(int).astype(str),
+                textposition="outside",
+                name=feature,
+            )
+        )
+        if plot_frame["rank_value"].notna().any():
+            figure.add_hline(y=0.0, line_dash="dot", line_color="gray")
+        figure.update_layout(
+            template="plotly_white",
+            title=f"{feature} | {rank_col} ({rank_aggfunc}) by bucket",
+            xaxis_title=feature,
+            yaxis_title=f"{rank_col} ({rank_aggfunc})",
+            height=500,
+            width=900,
+            showlegend=False,
+        )
+        return figure
+
     def analyze_feature_win_rates(
         self,
         *,
@@ -682,15 +771,18 @@ class BlueChipRangeReversionResearcher:
         closed_only: bool = True,
         refresh_trade_df: bool = False,
         pnl_column: str = "pnl_pct",
-    ) -> dict[str, pd.DataFrame]:
+        rank_col: str = "win_rate",
+        rank_aggfunc: str = "mean",
+    ) -> dict[str, object]:
         """
-        Summarize which feature ranges lead to the highest and lowest win rates.
+        Summarize how trade outcomes vary across feature buckets.
 
         The method works directly off ``trade_df`` so the output reflects the
         strategy's trade-level research outcomes rather than candle-level rows.
         It bins each feature either by exact category values (for low-cardinality
-        numeric features) or by quantiles, then reports win rate and return
-        statistics per bucket.
+        numeric features) or by quantiles, then reports win rate, return, and
+        arbitrary ``rank_col`` statistics per bucket. It also returns one bar
+        chart per feature so bucket comparisons are easy to inspect visually.
         """
         if n_buckets < 2:
             raise ValueError("n_buckets must be at least 2.")
@@ -698,6 +790,8 @@ class BlueChipRangeReversionResearcher:
             raise ValueError("min_bucket_size must be at least 1.")
         if max_exact_categories < 1:
             raise ValueError("max_exact_categories must be at least 1.")
+        if rank_aggfunc not in {"mean", "median"}:
+            raise ValueError("rank_aggfunc must be either 'mean' or 'median'.")
 
         trade_df = self.add_trade_df() if refresh_trade_df or self.trade_df.empty else self.trade_df.copy()
         if trade_df.empty:
@@ -713,6 +807,12 @@ class BlueChipRangeReversionResearcher:
             raise ValueError("No closed trades with non-null pnl are available for feature analysis.")
 
         analysis_frame["win"] = analysis_frame[pnl_column].gt(0)
+        if rank_col != "win_rate":
+            if rank_col not in analysis_frame.columns:
+                raise ValueError(f"trade_df does not contain the requested rank_col: {rank_col}")
+            analysis_frame["rank_metric"] = pd.to_numeric(analysis_frame[rank_col], errors="coerce")
+        else:
+            analysis_frame["rank_metric"] = analysis_frame["win"].astype(float)
         selected_features = feature_columns or list(self.FEATURE_ANALYSIS_COLUMNS)
 
         bucket_frames: list[pd.DataFrame] = []
@@ -728,7 +828,7 @@ class BlueChipRangeReversionResearcher:
                 skipped_features.append({"feature": feature, "reason": "insufficient_non_null_values"})
                 continue
 
-            working = analysis_frame.loc[valid_mask, ["ticker", pnl_column, "win"]].copy()
+            working = analysis_frame.loc[valid_mask, ["ticker", pnl_column, "win", "rank_metric"]].copy()
             working[feature] = feature_series.loc[valid_mask].astype(float)
             unique_values = np.sort(working[feature].unique())
 
@@ -762,6 +862,12 @@ class BlueChipRangeReversionResearcher:
                     win_count=("win", "sum"),
                     mean_return=(pnl_column, "mean"),
                     median_return=(pnl_column, "median"),
+                    rank_non_null_count=("rank_metric", lambda series: int(series.notna().sum())),
+                    rank_mean=("rank_metric", "mean"),
+                    rank_median=("rank_metric", "median"),
+                    rank_std=("rank_metric", "std"),
+                    rank_min=("rank_metric", "min"),
+                    rank_max=("rank_metric", "max"),
                     feature_min=(feature, "min"),
                     feature_max=(feature, "max"),
                 )
@@ -775,6 +881,15 @@ class BlueChipRangeReversionResearcher:
             grouped["feature"] = feature
             grouped["loss_count"] = grouped["count"] - grouped["win_count"]
             grouped["win_rate"] = grouped["win_count"] / grouped["count"]
+            if rank_col == "win_rate":
+                grouped["rank_mean"] = grouped["win_rate"]
+                grouped["rank_median"] = grouped["win_rate"]
+                grouped["rank_std"] = np.nan
+                grouped["rank_min"] = grouped["win_rate"]
+                grouped["rank_max"] = grouped["win_rate"]
+            grouped["rank_col"] = rank_col
+            grouped["rank_aggfunc"] = rank_aggfunc
+            grouped["rank_value"] = grouped["rank_mean"] if rank_aggfunc == "mean" else grouped["rank_median"]
             bucket_frames.append(
                 grouped.loc[
                     :,
@@ -789,6 +904,15 @@ class BlueChipRangeReversionResearcher:
                         "win_rate",
                         "mean_return",
                         "median_return",
+                        "rank_col",
+                        "rank_aggfunc",
+                        "rank_non_null_count",
+                        "rank_mean",
+                        "rank_median",
+                        "rank_std",
+                        "rank_min",
+                        "rank_max",
+                        "rank_value",
                         "feature_min",
                         "feature_max",
                     ],
@@ -810,6 +934,15 @@ class BlueChipRangeReversionResearcher:
                     "win_rate",
                     "mean_return",
                     "median_return",
+                    "rank_col",
+                    "rank_aggfunc",
+                    "rank_non_null_count",
+                    "rank_mean",
+                    "rank_median",
+                    "rank_std",
+                    "rank_min",
+                    "rank_max",
+                    "rank_value",
                     "feature_min",
                     "feature_max",
                 ]
@@ -829,41 +962,60 @@ class BlueChipRangeReversionResearcher:
                 "feature",
                 "bucket_count",
                 "total_trades",
+                "rank_col",
+                "rank_aggfunc",
                 "best_bucket",
+                "best_rank_value",
                 "best_win_rate",
                 "worst_bucket",
+                "worst_rank_value",
                 "worst_win_rate",
+                "rank_spread",
                 "win_rate_spread",
             ]
         )
+        feature_bar_plots: dict[str, go.Figure] = {}
         if not bucket_summary.empty:
             best_rows: list[pd.Series] = []
             worst_rows: list[pd.Series] = []
             feature_rows: list[dict[str, object]] = []
             for feature, group in bucket_summary.groupby("feature", sort=True):
                 ordered_best = group.sort_values(
-                    ["win_rate", "mean_return", "count", "bucket_order"],
-                    ascending=[False, False, False, True],
+                    ["rank_value", "mean_return", "win_rate", "count", "bucket_order"],
+                    ascending=[False, False, False, False, True],
                     kind="mergesort",
                 ).reset_index(drop=True)
                 ordered_worst = group.sort_values(
-                    ["win_rate", "mean_return", "count", "bucket_order"],
-                    ascending=[True, True, False, True],
+                    ["rank_value", "mean_return", "win_rate", "count", "bucket_order"],
+                    ascending=[True, True, True, False, True],
                     kind="mergesort",
                 ).reset_index(drop=True)
                 best_row = ordered_best.iloc[0]
                 worst_row = ordered_worst.iloc[0]
                 best_rows.append(best_row)
                 worst_rows.append(worst_row)
+                feature_bar_plots[str(feature)] = self._build_feature_bucket_bar_plot(
+                    group,
+                    feature=str(feature),
+                    rank_col=rank_col,
+                    rank_aggfunc=rank_aggfunc,
+                )
                 feature_rows.append(
                     {
                         "feature": feature,
                         "bucket_count": int(len(group)),
                         "total_trades": int(group["count"].sum()),
+                        "rank_col": rank_col,
+                        "rank_aggfunc": rank_aggfunc,
                         "best_bucket": str(best_row["feature_bucket"]),
+                        "best_rank_value": float(best_row["rank_value"]) if pd.notna(best_row["rank_value"]) else np.nan,
                         "best_win_rate": float(best_row["win_rate"]),
                         "worst_bucket": str(worst_row["feature_bucket"]),
+                        "worst_rank_value": float(worst_row["rank_value"]) if pd.notna(worst_row["rank_value"]) else np.nan,
                         "worst_win_rate": float(worst_row["win_rate"]),
+                        "rank_spread": float(best_row["rank_value"] - worst_row["rank_value"])
+                        if pd.notna(best_row["rank_value"]) and pd.notna(worst_row["rank_value"])
+                        else np.nan,
                         "win_rate_spread": float(best_row["win_rate"] - worst_row["win_rate"]),
                     }
                 )
@@ -884,6 +1036,7 @@ class BlueChipRangeReversionResearcher:
             "best_buckets": best_buckets,
             "worst_buckets": worst_buckets,
             "skipped_features": skipped_features_df,
+            "feature_bar_plots": feature_bar_plots,
         }
 
     def get_candidates(self, as_of_date: str | pd.Timestamp | None = None) -> pd.DataFrame:
@@ -915,6 +1068,12 @@ class BlueChipRangeReversionResearcher:
             "range_amplitude",
             "zone_position",
             "expected_upside_to_upper",
+            "close_gt_open",
+            "close_gt_prev_high",
+            "close_gt_sma_5",
+            "inside_bar",
+            "outside_bar",
+            "not_inside_bar",
             "rebound_confirm_count",
             "entry_signal",
         ]
@@ -982,8 +1141,11 @@ class BlueChipRangeReversionResearcher:
                     "expected_upside_ok",
                     "rebound_confirmed",
                     "close_gt_open",
-                    "close_gt_prev_close",
+                    "close_gt_prev_high",
                     "close_gt_sma_5",
+                    "inside_bar",
+                    "outside_bar",
+                    "not_inside_bar",
                     "entry_signal",
                     "entry_signal_executed",
                 ],
@@ -993,8 +1155,11 @@ class BlueChipRangeReversionResearcher:
                     bool(signal_row["expected_upside_ok"].iat[0]),
                     bool(signal_row["rebound_confirmed"].iat[0]),
                     bool(signal_row["close_gt_open"].iat[0]),
-                    bool(signal_row["close_gt_prev_close"].iat[0]),
+                    bool(signal_row["close_gt_prev_high"].iat[0]),
                     bool(signal_row["close_gt_sma_5"].iat[0]),
+                    bool(signal_row["inside_bar"].iat[0]),
+                    bool(signal_row["outside_bar"].iat[0]),
+                    bool(signal_row["not_inside_bar"].iat[0]),
                     bool(signal_row["entry_signal"].iat[0]),
                     bool(signal_row["entry_signal_executed"].iat[0]),
                 ],
@@ -1038,11 +1203,20 @@ class BlueChipRangeReversionResearcher:
             "range_mid",
             "range_amplitude",
             "zone_position",
+            "sma_20",
+            "sma_60",
+            "sma_120",
             "ret_60d",
             "ma_dispersion",
             "lower_touch_count",
             "upper_touch_count",
             "expected_upside_to_upper",
+            "close_gt_open",
+            "close_gt_prev_high",
+            "close_gt_sma_5",
+            "inside_bar",
+            "outside_bar",
+            "not_inside_bar",
             "rebound_confirm_count",
             "entry_date_next",
             "entry_open_next",
@@ -1084,12 +1258,12 @@ class BlueChipRangeReversionResearcher:
             return go.Figure()
 
         figure = make_subplots(
-            rows=2,
+            rows=3,
             cols=1,
             shared_xaxes=True,
             vertical_spacing=0.08,
-            row_heights=[0.72, 0.28],
-            subplot_titles=("Price Context", "Signal Conditions"),
+            row_heights=[0.6, 0.18, 0.22],
+            subplot_titles=("Price Context", "Signal Metrics", "Signal Conditions"),
         )
         figure.add_trace(
             go.Candlestick(
@@ -1103,6 +1277,23 @@ class BlueChipRangeReversionResearcher:
             row=1,
             col=1,
         )
+        for column, name, color, dash in [
+            ("sma_20", "SMA 20", "steelblue", "solid"),
+            ("sma_60", "SMA 60", "mediumpurple", "dash"),
+            ("sma_120", "SMA 120", "slategray", "dot"),
+        ]:
+            if column in price_window.columns:
+                figure.add_trace(
+                    go.Scatter(
+                        x=price_window["date"],
+                        y=price_window[column],
+                        mode="lines",
+                        name=name,
+                        line=dict(color=color, width=1.2, dash=dash),
+                    ),
+                    row=1,
+                    col=1,
+                )
         for column, name, color in [
             ("range_upper", "Range Upper", "firebrick"),
             ("range_mid", "Range Mid", "darkorange"),
@@ -1127,7 +1318,25 @@ class BlueChipRangeReversionResearcher:
         exit_reason = (
             None if pd.isna(signal_row["exit_reason"].iat[0]) else str(signal_row["exit_reason"].iat[0])
         )
+        ret_60d = signal_row["ret_60d"].iat[0] if "ret_60d" in signal_row.columns else np.nan
+        ma_dispersion = signal_row["ma_dispersion"].iat[0] if "ma_dispersion" in signal_row.columns else np.nan
         figure.add_vline(x=signal_row["date"].iat[0], line_dash="dash", line_color="royalblue", row=1, col=1)
+        stats_lines = [
+            f"Ret 60D: {ret_60d:.2%}" if pd.notna(ret_60d) else "Ret 60D: n/a",
+            f"MA Dispersion: {ma_dispersion:.2%}" if pd.notna(ma_dispersion) else "MA Dispersion: n/a",
+        ]
+        figure.add_annotation(
+            x=0.01,
+            y=0.98,
+            xref="paper",
+            yref="paper",
+            text="<br>".join(stats_lines),
+            showarrow=False,
+            align="left",
+            bgcolor="rgba(255,255,255,0.85)",
+            bordercolor="gray",
+            borderwidth=1,
+        )
         if pd.notna(entry_date):
             entry_rows = price_window[price_window["date"] == entry_date]
             entry_price = signal_row["entry_open_next"].iat[0]
@@ -1209,6 +1418,34 @@ class BlueChipRangeReversionResearcher:
                 col=1,
             )
 
+        if "ret_60d" in price_window.columns:
+            figure.add_trace(
+                go.Scatter(
+                    x=price_window["date"],
+                    y=price_window["ret_60d"],
+                    mode="lines",
+                    name="Ret 60D",
+                    line=dict(color="teal", width=1.8),
+                    hovertemplate="Ret 60D<br>Date=%{x}<br>Value=%{y:.2%}<extra></extra>",
+                ),
+                row=2,
+                col=1,
+            )
+        if "ma_dispersion" in price_window.columns:
+            figure.add_trace(
+                go.Scatter(
+                    x=price_window["date"],
+                    y=price_window["ma_dispersion"],
+                    mode="lines",
+                    name="MA Dispersion",
+                    line=dict(color="darkgoldenrod", width=1.6, dash="dash"),
+                    hovertemplate="MA Dispersion<br>Date=%{x}<br>Value=%{y:.2%}<extra></extra>",
+                ),
+                row=2,
+                col=1,
+            )
+        figure.add_hline(y=0.0, line_dash="dot", line_color="gray", row=2, col=1)
+
         figure.add_trace(
             go.Bar(
                 x=checklist["condition"],
@@ -1217,20 +1454,26 @@ class BlueChipRangeReversionResearcher:
                 textposition="outside",
                 name="Conditions",
             ),
-            row=2,
+            row=3,
             col=1,
         )
         summary = inspection["summary"]
         return_text = summary["realized_open_to_open_return"]
         title = (
             f"{ticker} | signal {pd.Timestamp(summary['signal_date']).date()} | "
+            f"ret60 {ret_60d:.2%} | "
             f"exit {summary['exit_reason']} | "
             f"return {return_text:.2%}"
-            if pd.notna(return_text)
-            else f"{ticker} | signal {pd.Timestamp(summary['signal_date']).date()}"
+            if pd.notna(return_text) and pd.notna(ret_60d)
+            else (
+                f"{ticker} | signal {pd.Timestamp(summary['signal_date']).date()} | "
+                f"ret60 {ret_60d:.2%}"
+                if pd.notna(ret_60d)
+                else f"{ticker} | signal {pd.Timestamp(summary['signal_date']).date()}"
+            )
         )
         figure.update_layout(
-            height=850,
+            height=980,
             width=1200,
             template="plotly_white",
             hovermode="x unified",
@@ -1239,5 +1482,6 @@ class BlueChipRangeReversionResearcher:
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0),
         )
         figure.update_yaxes(title_text="Price", row=1, col=1)
-        figure.update_yaxes(title_text="Met", row=2, col=1, range=[0, 1.2])
+        figure.update_yaxes(title_text="Metric", tickformat=".0%", row=2, col=1)
+        figure.update_yaxes(title_text="Met", row=3, col=1, range=[0, 1.2])
         return figure

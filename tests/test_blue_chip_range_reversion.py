@@ -199,6 +199,9 @@ class BlueChipRangeReversionResearcherTest(unittest.TestCase):
         aaa_no_rebound = output[(output["ticker"] == "AAA") & (output["date"] == no_rebound_date)].iloc[0]
 
         self.assertTrue(bool(aaa_signal["range_candidate"]))
+        self.assertTrue(bool(aaa_signal["close_gt_open"]))
+        self.assertTrue(bool(aaa_signal["not_inside_bar"]))
+        self.assertEqual(int(aaa_signal["rebound_confirm_count"]), 1)
         self.assertTrue(bool(aaa_signal["rebound_confirmed"]))
         self.assertTrue(bool(aaa_signal["expected_upside_ok"]))
         self.assertTrue(bool(aaa_signal["entry_signal"]))
@@ -209,12 +212,42 @@ class BlueChipRangeReversionResearcherTest(unittest.TestCase):
         self.assertFalse(bool(bbb_signal["entry_signal"]))
 
         self.assertTrue(bool(aaa_no_rebound["range_candidate"]))
-        self.assertEqual(int(aaa_no_rebound["rebound_confirm_count"]), 1)
+        self.assertTrue(bool(aaa_no_rebound["close_gt_open"]))
+        self.assertTrue(bool(aaa_no_rebound["not_inside_bar"]))
+        self.assertEqual(int(aaa_no_rebound["rebound_confirm_count"]), 0)
         self.assertFalse(bool(aaa_no_rebound["rebound_confirmed"]))
         self.assertFalse(bool(aaa_no_rebound["entry_signal"]))
 
         candidates = researcher.get_candidates(as_of_date=signal_date)
         self.assertEqual(candidates["ticker"].tolist(), ["AAA"])
+
+    def test_min_return_60_filters_out_names_below_the_floor(self) -> None:
+        panel, signal_date, _ = make_signal_research_panel()
+        baseline = BlueChipRangeReversionResearcher(
+            panel,
+            config=RangeStrategyConfig(range_window=20, max_ma_dispersion=0.2),
+        )
+        baseline.add_signals()
+        baseline_output = baseline.stock_candle_df
+        baseline_aaa = baseline_output[(baseline_output["ticker"] == "AAA") & (baseline_output["date"] == signal_date)].iloc[0]
+        self.assertTrue(bool(baseline_aaa["range_candidate"]))
+
+        researcher = BlueChipRangeReversionResearcher(
+            panel,
+            config=RangeStrategyConfig(
+                range_window=20,
+                max_ma_dispersion=0.2,
+                min_return_60=0.0,
+                max_abs_return_60=0.15,
+            ),
+        )
+        researcher.add_signals()
+
+        output = researcher.stock_candle_df
+        aaa_signal = output[(output["ticker"] == "AAA") & (output["date"] == signal_date)].iloc[0]
+
+        self.assertLess(float(aaa_signal["ret_60d"]), 0.0)
+        self.assertFalse(bool(aaa_signal["range_candidate"]))
 
     def test_add_research_outcomes_handles_exit_paths_and_suppresses_reentries(self) -> None:
         researcher = make_manual_outcome_researcher()
@@ -409,6 +442,31 @@ class BlueChipRangeReversionResearcherTest(unittest.TestCase):
         self.assertEqual(str(worst_buckets.loc["rebound_confirm_count", "feature_bucket"]), "2.0")
         self.assertEqual(skipped.loc["missing_feature", "reason"], "missing_column")
 
+        feature_plots = analysis["feature_bar_plots"]
+        self.assertIn("zone_position", feature_plots)
+        self.assertIn("rebound_confirm_count", feature_plots)
+        self.assertIsInstance(feature_plots["zone_position"], go.Figure)
+
+        ranked_by_return = researcher.analyze_feature_win_rates(
+            feature_columns=["zone_position"],
+            n_buckets=2,
+            min_bucket_size=2,
+            rank_col="pnl_pct",
+            rank_aggfunc="mean",
+        )
+        ranked_feature_summary = ranked_by_return["feature_summary"].set_index("feature")
+        ranked_best = ranked_by_return["best_buckets"].set_index("feature")
+        ranked_worst = ranked_by_return["worst_buckets"].set_index("feature")
+
+        self.assertEqual(ranked_feature_summary.loc["zone_position", "rank_col"], "pnl_pct")
+        self.assertEqual(ranked_feature_summary.loc["zone_position", "rank_aggfunc"], "mean")
+        self.assertGreater(
+            ranked_feature_summary.loc["zone_position", "best_rank_value"],
+            ranked_feature_summary.loc["zone_position", "worst_rank_value"],
+        )
+        self.assertAlmostEqual(float(ranked_best.loc["zone_position", "rank_value"]), 0.05666666666666667)
+        self.assertAlmostEqual(float(ranked_worst.loc["zone_position", "rank_value"]), -0.006666666666666665)
+
     def test_inspect_signal_and_plot_signal_context_return_explainable_context(self) -> None:
         panel, signal_date, _ = make_signal_research_panel()
         researcher = BlueChipRangeReversionResearcher(
@@ -433,7 +491,14 @@ class BlueChipRangeReversionResearcherTest(unittest.TestCase):
 
         figure = researcher.plot_signal_context("AAA", signal_date, lookback=5, lookahead=3)
         self.assertIsInstance(figure, go.Figure)
-        self.assertGreaterEqual(len(figure.data), 4)
+        self.assertGreaterEqual(len(figure.data), 9)
+        trace_names = {trace.name for trace in figure.data}
+        self.assertIn("SMA 20", trace_names)
+        self.assertIn("SMA 60", trace_names)
+        self.assertIn("SMA 120", trace_names)
+        self.assertIn("Ret 60D", trace_names)
+        self.assertIn("MA Dispersion", trace_names)
+        self.assertIn("ret60", str(figure.layout.title.text))
         self.assertTrue(any("open_position" in getattr(annotation, "text", "") for annotation in figure.layout.annotations))
 
         closed_researcher = make_manual_outcome_researcher()
