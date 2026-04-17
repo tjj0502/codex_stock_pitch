@@ -2,135 +2,33 @@ from __future__ import annotations
 
 import sys
 from dataclasses import asdict, replace
-from itertools import product
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Mapping
 
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from backtester import TradePlanBacktester
-from strategies.blue_chip_range_reversion import BlueChipRangeReversionResearcher, RangeStrategyConfig
+from score_system.blue_chip_grid_search import (
+    build_grid_search_figure,
+    expand_param_grid,
+    format_param_label,
+)
+from strategies.trend_pullback_continuation import (
+    TrendPullbackContinuationResearcher,
+    TrendPullbackStrategyConfig,
+)
 
 
-def expand_param_grid(param_grid: Mapping[str, Iterable[Any]]) -> list[dict[str, Any]]:
-    """Expand a dict-of-lists grid into a list of parameter dictionaries."""
-    if not param_grid:
-        return [{}]
-
-    keys = list(param_grid.keys())
-    value_lists = [list(param_grid[key]) for key in keys]
-    if any(len(values) == 0 for values in value_lists):
-        raise ValueError("Every parameter in param_grid must contain at least one candidate value.")
-
-    combinations: list[dict[str, Any]] = []
-    for values in product(*value_lists):
-        combinations.append(dict(zip(keys, values)))
-    return combinations
-
-
-def format_param_label(params: Mapping[str, Any], *, max_items: int | None = None) -> str:
-    """Create a compact human-readable label for one parameter combination."""
-    items = list(params.items())
-    if max_items is not None:
-        items = items[:max_items]
-    if not items:
-        return "base"
-    return ", ".join(f"{key}={value}" for key, value in items)
-
-
-def build_grid_search_figure(
-    nav_curves: pd.DataFrame,
-    sharpe_curves: pd.DataFrame,
-    benchmark_curve: pd.DataFrame,
-    *,
-    benchmark_sharpe_curve: pd.DataFrame | None = None,
-    title: str = "Blue Chip Range Reversion Grid Search",
-) -> go.Figure:
-    """Plot normalized NAV curves and rolling Sharpe curves for each parameter set."""
-    figure = make_subplots(
-        rows=2,
-        cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.08,
-        subplot_titles=("Normalized NAV", "Rolling Sharpe"),
-    )
-
-    if not benchmark_curve.empty:
-        figure.add_trace(
-            go.Scatter(
-                x=benchmark_curve["date"],
-                y=benchmark_curve["benchmark_nav_norm"],
-                mode="lines",
-                name="Benchmark NAV",
-                line=dict(color="black", width=2, dash="dash"),
-            ),
-            row=1,
-            col=1,
-        )
-
-    if not nav_curves.empty:
-        for label, group in nav_curves.groupby("label", sort=False):
-            figure.add_trace(
-                go.Scatter(
-                    x=group["date"],
-                    y=group["strategy_nav_norm"],
-                    mode="lines",
-                    name=f"{label} NAV",
-                ),
-                row=1,
-                col=1,
-            )
-
-    if benchmark_sharpe_curve is not None and not benchmark_sharpe_curve.empty:
-        figure.add_trace(
-            go.Scatter(
-                x=benchmark_sharpe_curve["date"],
-                y=benchmark_sharpe_curve["rolling_sharpe"],
-                mode="lines",
-                name="Benchmark Sharpe",
-                line=dict(color="black", width=2, dash="dot"),
-            ),
-            row=2,
-            col=1,
-        )
-
-    if not sharpe_curves.empty:
-        for label, group in sharpe_curves.groupby("label", sort=False):
-            figure.add_trace(
-                go.Scatter(
-                    x=group["date"],
-                    y=group["rolling_sharpe"],
-                    mode="lines",
-                    name=f"{label} Sharpe",
-                ),
-                row=2,
-                col=1,
-            )
-
-    figure.update_layout(
-        height=900,
-        width=1300,
-        template="plotly_white",
-        hovermode="x unified",
-        title=title,
-    )
-    figure.update_yaxes(title_text="NAV", row=1, col=1)
-    figure.update_yaxes(title_text="Sharpe", row=2, col=1)
-    return figure
-
-
-def run_blue_chip_grid_search(
+def run_trend_pullback_grid_search(
     stock_candle_df: pd.DataFrame,
     *,
-    param_grid: Mapping[str, Iterable[Any]],
-    base_config: RangeStrategyConfig | None = None,
+    param_grid: Mapping[str, list[Any]],
+    base_config: TrendPullbackStrategyConfig | None = None,
     start_date: str | pd.Timestamp | None = None,
     end_date: str | pd.Timestamp | None = None,
     backtester_kwargs: Mapping[str, Any] | None = None,
@@ -139,10 +37,10 @@ def run_blue_chip_grid_search(
     skip_failures: bool = True,
 ) -> dict[str, Any]:
     """
-    Run a parameter grid over the blue-chip range strategy and keep full curves.
+    Run a parameter grid over the trend-pullback continuation strategy.
 
-    Returns summary tables plus long-form NAV and Sharpe curves so callers can
-    inspect, rank, and replot the grid search outputs.
+    The return shape intentionally mirrors ``run_blue_chip_grid_search`` so
+    notebook analysis can be reused with minimal changes.
     """
     if sharpe_window < 2:
         raise ValueError("sharpe_window must be at least 2.")
@@ -153,7 +51,7 @@ def run_blue_chip_grid_search(
     if sharpe_min_periods < 1:
         raise ValueError("sharpe_min_periods must be at least 1.")
 
-    config_template = base_config or RangeStrategyConfig()
+    config_template = base_config or TrendPullbackStrategyConfig()
     backtester_kwargs = dict(backtester_kwargs or {})
 
     summary_rows: list[dict[str, Any]] = []
@@ -168,7 +66,7 @@ def run_blue_chip_grid_search(
         label = format_param_label(overrides)
         try:
             config = replace(config_template, **overrides)
-            researcher = BlueChipRangeReversionResearcher(stock_candle_df, config=config)
+            researcher = TrendPullbackContinuationResearcher(stock_candle_df, config=config)
             backtester = TradePlanBacktester(
                 stock_candle_df,
                 researcher=researcher,
@@ -253,6 +151,7 @@ def run_blue_chip_grid_search(
         sharpe_curves=sharpe_curves,
         benchmark_curve=benchmark_curve,
         benchmark_sharpe_curve=benchmark_sharpe_curve,
+        title="Trend Pullback Continuation Grid Search",
     )
     return {
         "summary": summary,
@@ -263,3 +162,6 @@ def run_blue_chip_grid_search(
         "errors": errors,
         "figure": figure,
     }
+
+
+__all__ = ["run_trend_pullback_grid_search"]

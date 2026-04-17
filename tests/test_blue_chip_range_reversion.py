@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 
-from blue_chip_range_reversion import BlueChipRangeReversionResearcher, RangeStrategyConfig
+from strategies.blue_chip_range_reversion import BlueChipRangeReversionResearcher, RangeStrategyConfig
 
 
 def make_stock_frame(

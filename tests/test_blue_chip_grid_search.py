@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 
-from blue_chip_range_reversion import RangeStrategyConfig
+from strategies.blue_chip_range_reversion import RangeStrategyConfig
 from score_system.blue_chip_grid_search import run_blue_chip_grid_search
 
 

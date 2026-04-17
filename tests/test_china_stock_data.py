@@ -3,7 +3,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pandas as pd
 
-import china_stock_data
+import strategies.china_stock_data as china_stock_data
 
 
 def make_constituents_frame() -> pd.DataFrame:
@@ -75,7 +75,7 @@ class IndexDataFetchTest(unittest.TestCase):
         "change_amount",
     ]
 
-    @patch("china_stock_data._get_tushare_client")
+    @patch("strategies.china_stock_data._get_tushare_client")
     def test_get_index_constituents_returns_latest_snapshot_with_metadata(
         self,
         mock_get_client: MagicMock,
@@ -116,7 +116,7 @@ class IndexDataFetchTest(unittest.TestCase):
             end_date="20250331",
         )
 
-    @patch("china_stock_data._get_tushare_client")
+    @patch("strategies.china_stock_data._get_tushare_client")
     def test_get_trade_calendar_normalizes_dates_and_filters_open_days(
         self,
         mock_get_client: MagicMock,
@@ -144,7 +144,7 @@ class IndexDataFetchTest(unittest.TestCase):
             end_date="20250407",
         )
 
-    @patch("china_stock_data.get_trade_calendar")
+    @patch("strategies.china_stock_data.get_trade_calendar")
     def test_get_next_trading_day_returns_first_open_date(
         self,
         mock_get_trade_calendar: MagicMock,
@@ -161,9 +161,9 @@ class IndexDataFetchTest(unittest.TestCase):
         self.assertEqual(result, pd.Timestamp("2025-04-07"))
         mock_get_trade_calendar.assert_called_once()
 
-    @patch("china_stock_data.ts.pro_bar")
-    @patch("china_stock_data._get_tushare_client")
-    @patch("china_stock_data.get_index_constituents")
+    @patch("strategies.china_stock_data.ts.pro_bar")
+    @patch("strategies.china_stock_data._get_tushare_client")
+    @patch("strategies.china_stock_data.get_index_constituents")
     def test_get_index_member_prices_fetches_qfq_adjusted_schema_and_metadata(
         self,
         mock_get_constituents: MagicMock,
@@ -243,9 +243,9 @@ class IndexDataFetchTest(unittest.TestCase):
             ],
         )
 
-    @patch("china_stock_data.ts.pro_bar")
-    @patch("china_stock_data._get_tushare_client")
-    @patch("china_stock_data.get_index_constituents")
+    @patch("strategies.china_stock_data.ts.pro_bar")
+    @patch("strategies.china_stock_data._get_tushare_client")
+    @patch("strategies.china_stock_data.get_index_constituents")
     def test_get_index_member_prices_returns_empty_frame_when_no_prices(
         self,
         mock_get_constituents: MagicMock,
@@ -271,9 +271,9 @@ class IndexDataFetchTest(unittest.TestCase):
         self.assertEqual(result.attrs["universe"], "hs300")
         self.assertEqual(result.attrs["constituent_history_mode"], "latest_snapshot")
 
-    @patch("china_stock_data.ts.pro_bar")
-    @patch("china_stock_data._get_tushare_client")
-    @patch("china_stock_data.get_index_constituents")
+    @patch("strategies.china_stock_data.ts.pro_bar")
+    @patch("strategies.china_stock_data._get_tushare_client")
+    @patch("strategies.china_stock_data.get_index_constituents")
     def test_get_index_member_prices_tracks_failed_tickers(
         self,
         mock_get_constituents: MagicMock,
@@ -301,8 +301,8 @@ class IndexDataFetchTest(unittest.TestCase):
         self.assertEqual(result.attrs["failed_tickers"], ["BBB"])
         self.assertEqual(result.attrs["price_adjustment"], "qfq")
 
-    @patch("china_stock_data.get_index_member_prices")
-    @patch("china_stock_data.get_index_constituents")
+    @patch("strategies.china_stock_data.get_index_member_prices")
+    @patch("strategies.china_stock_data.get_index_constituents")
     def test_index_wrappers_delegate_to_generic_helpers(
         self,
         mock_get_constituents: MagicMock,

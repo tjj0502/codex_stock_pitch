@@ -8,7 +8,7 @@ from pandas.api.types import (
     is_string_dtype,
 )
 
-from china_stock_data import DailyTechnicalScorer
+from strategies.china_stock_data import DailyTechnicalScorer
 
 
 def make_stock_frame(
