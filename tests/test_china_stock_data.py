@@ -161,6 +161,37 @@ class IndexDataFetchTest(unittest.TestCase):
         self.assertEqual(result, pd.Timestamp("2025-04-07"))
         mock_get_trade_calendar.assert_called_once()
 
+    @patch("strategies.china_stock_data._get_tushare_client")
+    def test_get_all_a_share_constituents_returns_latest_listed_snapshot(
+        self,
+        mock_get_client: MagicMock,
+    ) -> None:
+        mock_client = MagicMock()
+        mock_client.stock_basic.return_value = pd.DataFrame(
+            [
+                {"ts_code": "000001.SZ", "symbol": "000001", "name": "AAA Corp", "list_date": "20010101"},
+                {"ts_code": "600000.SH", "symbol": "600000", "name": "BBB Corp", "list_date": "19991110"},
+                {"ts_code": "430001.NQ", "symbol": "430001", "name": "Ignore Corp", "list_date": "20100101"},
+            ]
+        )
+        mock_get_client.return_value = mock_client
+
+        result = china_stock_data.get_all_a_share_constituents(end_date="2025-03-31")
+
+        self.assertEqual(result["ticker"].tolist(), ["000001", "600000"])
+        self.assertTrue((result["trade_date"] == "20250331").all())
+        self.assertTrue((result["weight"] == 1.0).all())
+        self.assertEqual(result.attrs["index_code"], "ALL_A")
+        self.assertEqual(result.attrs["universe"], "all_a")
+        self.assertEqual(result.attrs["index_label"], "All A Shares")
+        self.assertEqual(result.attrs["constituent_history_mode"], "latest_snapshot")
+        self.assertEqual(result.attrs["constituent_trade_date"], "20250331")
+        mock_client.stock_basic.assert_called_once_with(
+            exchange="",
+            list_status="L",
+            fields="ts_code,symbol,name,list_date",
+        )
+
     @patch("strategies.china_stock_data.ts.pro_bar")
     @patch("strategies.china_stock_data._get_tushare_client")
     @patch("strategies.china_stock_data.get_index_constituents")
@@ -301,6 +332,31 @@ class IndexDataFetchTest(unittest.TestCase):
         self.assertEqual(result.attrs["failed_tickers"], ["BBB"])
         self.assertEqual(result.attrs["price_adjustment"], "qfq")
 
+    @patch("strategies.china_stock_data._fetch_member_prices_for_constituents")
+    @patch("strategies.china_stock_data.get_all_a_share_constituents")
+    def test_get_all_a_share_member_prices_delegates_to_full_universe_helpers(
+        self,
+        mock_get_constituents: MagicMock,
+        mock_fetch_member_prices: MagicMock,
+    ) -> None:
+        mock_get_constituents.return_value = pd.DataFrame(
+            [{"ticker": "000001", "ts_code": "000001.SZ", "name": "AAA Corp", "trade_date": "20250331", "weight": 1.0}]
+        )
+        mock_fetch_member_prices.return_value = pd.DataFrame()
+
+        china_stock_data.get_all_a_share_member_prices("2025-01-01", "2025-01-10")
+
+        mock_get_constituents.assert_called_once_with(token=None, end_date="2025-01-10")
+        mock_fetch_member_prices.assert_called_once_with(
+            mock_get_constituents.return_value,
+            metadata=china_stock_data.ALL_A_UNIVERSE_METADATA,
+            sd="2025-01-01",
+            ed="2025-01-10",
+            token=None,
+            pause_seconds=1.3,
+            max_calls_per_minute=195,
+        )
+
     @patch("strategies.china_stock_data.get_index_member_prices")
     @patch("strategies.china_stock_data.get_index_constituents")
     def test_index_wrappers_delegate_to_generic_helpers(
@@ -313,14 +369,17 @@ class IndexDataFetchTest(unittest.TestCase):
 
         china_stock_data.get_csi500_constituents(start_date="2025-03-01", end_date="2025-03-31")
         china_stock_data.get_hs300_constituents(start_date="2025-03-01", end_date="2025-03-31")
+        china_stock_data.get_csi1000_constituents(start_date="2025-03-01", end_date="2025-03-31")
         china_stock_data.get_csi500_member_prices("2025-01-01", "2025-01-10")
         china_stock_data.get_hs300_member_prices("2025-01-01", "2025-01-10")
+        china_stock_data.get_csi1000_member_prices("2025-01-01", "2025-01-10")
 
         self.assertEqual(
             mock_get_constituents.call_args_list,
             [
                 call("000905.SH", token=None, start_date="2025-03-01", end_date="2025-03-31"),
                 call("000300.SH", token=None, start_date="2025-03-01", end_date="2025-03-31"),
+                call("000852.SH", token=None, start_date="2025-03-01", end_date="2025-03-31"),
             ],
         )
         self.assertEqual(
@@ -336,6 +395,14 @@ class IndexDataFetchTest(unittest.TestCase):
                 ),
                 call(
                     "000300.SH",
+                    sd="2025-01-01",
+                    ed="2025-01-10",
+                    token=None,
+                    pause_seconds=1.3,
+                    max_calls_per_minute=195,
+                ),
+                call(
+                    "000852.SH",
                     sd="2025-01-01",
                     ed="2025-01-10",
                     token=None,

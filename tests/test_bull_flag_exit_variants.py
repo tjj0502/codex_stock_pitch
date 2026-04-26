@@ -101,6 +101,7 @@ def make_dynamic_exit_researcher(
     )
     prepared = prepared.drop(columns=[column for column in removable_columns if column in prepared.columns])
     prepared["sma_20"] = 101.0
+    prepared["ema_20"] = 101.5
     prepared["sma_60"] = 100.0
     prepared["sma_120"] = 99.0
     prepared["bullish_stack"] = True
@@ -116,6 +117,15 @@ def make_dynamic_exit_researcher(
     prepared["signal_upper_shadow_pct"] = 0.10
     prepared["signal_lower_shadow_pct"] = 0.10
     prepared["signal_quality_ok"] = True
+    prepared["narrow_uptrend_state"] = False
+    prepared["narrow_uptrend_run_length"] = 0
+    prepared["narrow_state_bear_ratio"] = np.nan
+    prepared["narrow_state_ema20_above_ratio"] = np.nan
+    prepared["narrow_state_max_consecutive_bear_bars"] = 0
+    prepared["narrow_state_peak_upper_shadow_pct"] = np.nan
+    prepared["left_state_start_date"] = pd.NaT
+    prepared["left_state_end_date"] = pd.NaT
+    prepared["left_state_bars"] = np.nan
     prepared["signal_bullish_stack_run_length"] = np.nan
     prepared["signal_stack_spread_pct"] = np.nan
     prepared["signal_sma20_return_5"] = np.nan
@@ -165,6 +175,27 @@ def make_dynamic_exit_researcher(
 
     researcher.stock_candle_df = prepared
     return researcher, dates
+
+
+def make_dynamic_live_candidate_researcher(
+    researcher_cls,
+    *,
+    open_values: list[float],
+    high_values: list[float],
+    low_values: list[float],
+    close_values: list[float],
+    config: BullFlagDynamicExitConfig | None = None,
+) -> tuple[object, pd.DatetimeIndex]:
+    researcher, dates = make_dynamic_exit_researcher(
+        researcher_cls,
+        open_values=open_values,
+        high_values=high_values,
+        low_values=low_values,
+        close_values=close_values,
+        config=config,
+    )
+    researcher.stock_candle_df = researcher.stock_candle_df.iloc[:2].copy().reset_index(drop=True)
+    return researcher, dates[:2]
 
 
 class BullFlagExitVariantTests(unittest.TestCase):
@@ -639,6 +670,40 @@ class BullFlagExitVariantTests(unittest.TestCase):
         self.assertIn("TP1", trace_names)
         self.assertIn("Active Stop", trace_names)
         self.assertIsInstance(figure, go.Figure)
+
+    def test_dynamic_inspect_signal_supports_live_candidate_without_exit_path(self) -> None:
+        researcher, dates = make_dynamic_live_candidate_researcher(
+            BullFlagTrailingAfterTp1Researcher,
+            open_values=[101.0, 103.0, 104.0, 108.0, 110.0, 109.0, 108.5, 109.0],
+            high_values=[103.0, 105.0, 108.0, 112.0, 114.0, 113.0, 110.0, 111.0],
+            low_values=[100.0, 102.5, 103.0, 106.0, 109.0, 108.0, 107.5, 108.0],
+            close_values=[102.0, 104.0, 106.0, 110.0, 113.0, 109.0, 108.5, 109.5],
+        )
+
+        inspection = researcher.inspect_signal("AAA", dates[0], lookback=1, lookahead=2)
+
+        self.assertEqual(inspection["summary"]["review_mode"], "live_candidate")
+        self.assertTrue(inspection["exit_path"].empty)
+        self.assertFalse(bool(inspection["summary"]["tp1_reached"]))
+        self.assertTrue(pd.isna(inspection["summary"]["tp1_price"]))
+
+    def test_dynamic_plot_live_candidate_keeps_setup_traces_only(self) -> None:
+        researcher, dates = make_dynamic_live_candidate_researcher(
+            BullFlagTrailingAfterTp1Researcher,
+            open_values=[101.0, 103.0, 104.0, 108.0, 110.0, 109.0, 108.5, 109.0],
+            high_values=[103.0, 105.0, 108.0, 112.0, 114.0, 113.0, 110.0, 111.0],
+            low_values=[100.0, 102.5, 103.0, 106.0, 109.0, 108.0, 107.5, 108.0],
+            close_values=[102.0, 104.0, 106.0, 110.0, 113.0, 109.0, 108.5, 109.5],
+        )
+
+        figure = researcher.plot_signal_context("AAA", dates[0], lookback=1, lookahead=2)
+        trace_names = {trace.name for trace in figure.data}
+
+        self.assertIn("Planned Entry", trace_names)
+        self.assertIn("Planned Hard Stop", trace_names)
+        self.assertIn("Planned Take Profit", trace_names)
+        self.assertNotIn("TP1", trace_names)
+        self.assertNotIn("Active Stop", trace_names)
 
 
 if __name__ == "__main__":

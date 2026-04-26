@@ -86,6 +86,7 @@ def make_annotation_frame(
     frame = pd.DataFrame(
         {
             "date": dates,
+            "open": np.asarray(values, dtype=float) - 0.1,
             "high": values,
             "low": values,
             "close": values,
@@ -121,8 +122,9 @@ def annotate_case(
     bullish_stack_false_positions: list[int] | None = None,
     signal_quality_positions: list[int] | None = None,
     close_gt_prev_high_positions: list[int] | None = None,
+    config: BullFlagStrategyConfig | None = None,
 ) -> pd.DataFrame:
-    researcher = make_annotation_researcher()
+    researcher = make_annotation_researcher(config=config)
     frame = make_annotation_frame(
         values,
         pivot_low_positions=pivot_low_positions,
@@ -236,6 +238,19 @@ def make_manual_signal_researcher(
     return researcher, dates
 
 
+def make_live_candidate_researcher(
+    *,
+    config: BullFlagStrategyConfig | None = None,
+    follow_through_high: float = 105.0,
+) -> tuple[BullFlagContinuationResearcher, pd.DatetimeIndex]:
+    researcher, dates = make_manual_signal_researcher(
+        config=config,
+        follow_through_high=follow_through_high,
+    )
+    researcher.stock_candle_df = researcher.stock_candle_df.iloc[:2].copy().reset_index(drop=True)
+    return researcher, dates[:2]
+
+
 class BullFlagContinuationResearcherTests(unittest.TestCase):
     def test_short_flag_and_breakout_generate_signal_candle(self) -> None:
         annotated = annotate_case(
@@ -295,6 +310,36 @@ class BullFlagContinuationResearcherTests(unittest.TestCase):
         signal_row = annotated.iloc[-1]
         self.assertTrue(bool(signal_row["bull_flag_candidate"]))
         self.assertTrue(bool(signal_row["signal_candle"]))
+
+    def test_mild_positive_slope_is_allowed_under_default_symmetric_bounds(self) -> None:
+        annotated = annotate_case(
+            [10.0, 12.0, 14.0, 16.0, 18.0, 20.0, 19.20, 19.25, 19.30, 19.35, 20.50],
+            pivot_low_positions=[0],
+            pivot_high_positions=[5],
+            signal_quality_positions=[10],
+            close_gt_prev_high_positions=[10],
+        )
+
+        signal_row = annotated.iloc[-1]
+        self.assertTrue(bool(signal_row["flag_channel_ok"]))
+        self.assertTrue(bool(signal_row["bull_flag_candidate"]))
+
+    def test_positive_slope_is_rejected_when_channel_requires_non_positive_slopes(self) -> None:
+        annotated = annotate_case(
+            [10.0, 12.0, 14.0, 16.0, 18.0, 20.0, 19.20, 19.25, 19.30, 19.35, 20.50],
+            pivot_low_positions=[0],
+            pivot_high_positions=[5],
+            signal_quality_positions=[10],
+            close_gt_prev_high_positions=[10],
+            config=BullFlagStrategyConfig(
+                min_flag_channel_slope_pct_per_bar=-0.008,
+                max_flag_channel_slope_pct_per_bar=0.0,
+            ),
+        )
+
+        signal_row = annotated.iloc[-1]
+        self.assertFalse(bool(signal_row["flag_channel_ok"]))
+        self.assertFalse(bool(signal_row["bull_flag_candidate"]))
 
     def test_setup_does_not_revive_after_bullish_stack_breaks_inside_flag(self) -> None:
         annotated = annotate_case(
@@ -423,11 +468,50 @@ class BullFlagContinuationResearcherTests(unittest.TestCase):
         trace_names = {trace.name for trace in figure.data}
 
         self.assertAlmostEqual(float(inspection["summary"]["flagpole_return"]), 0.25)
+        self.assertNotIn("left_trend_mode", inspection["summary"])
+        self.assertNotIn("left_state_start_date", inspection["summary"])
         self.assertIn("Flagpole Start", trace_names)
-        self.assertIn("Flag Peak", trace_names)
         self.assertIn("Flag Low", trace_names)
         self.assertIn("Flag Upper", trace_names)
         self.assertIn("Flag Lower", trace_names)
+
+    def test_classic_candidates_do_not_expose_narrow_trend_columns(self) -> None:
+        researcher, dates = make_live_candidate_researcher()
+        candidates = researcher.get_next_session_candidates(as_of_date=dates[1])
+
+        self.assertIn("signal_date", candidates.columns)
+        self.assertNotIn("left_state_start_date", candidates.columns)
+        self.assertNotIn("narrow_uptrend_run_length", candidates.columns)
+
+    def test_inspect_signal_supports_live_candidate_with_planned_values(self) -> None:
+        researcher, dates = make_live_candidate_researcher()
+        inspection = researcher.inspect_signal("AAA", dates[0], lookback=1, lookahead=2)
+
+        summary = inspection["summary"]
+        signal_row = inspection["signal_row"].iloc[0]
+
+        self.assertEqual(summary["review_mode"], "live_candidate")
+        self.assertFalse(bool(summary["executed_signal"]))
+        self.assertEqual(pd.Timestamp(summary["planned_entry_date"]), dates[1] + pd.offsets.BDay(1))
+        self.assertAlmostEqual(float(summary["planned_entry_price"]), 104.0, places=2)
+        self.assertAlmostEqual(float(summary["planned_hard_stop_price"]), 94.05, places=2)
+        self.assertAlmostEqual(float(summary["planned_take_profit_price"]), 119.0, places=2)
+        self.assertTrue(pd.isna(summary["entry_date_next"]))
+        self.assertTrue(pd.isna(summary["exit_date_next"]))
+        self.assertIsNone(summary["exit_reason"])
+        self.assertEqual(signal_row["review_mode"], "live_candidate")
+        self.assertAlmostEqual(float(signal_row["entry_reference_price"]), 104.0, places=2)
+        self.assertTrue(bool(signal_row["trend_environment_ok"]))
+
+    def test_plot_signal_context_draws_planned_lines_for_live_candidate(self) -> None:
+        researcher, dates = make_live_candidate_researcher()
+        figure = researcher.plot_signal_context("AAA", dates[0], lookback=1, lookahead=2)
+        trace_names = {trace.name for trace in figure.data}
+
+        self.assertIn("Planned Entry", trace_names)
+        self.assertIn("Planned Hard Stop", trace_names)
+        self.assertIn("Planned Take Profit", trace_names)
+        self.assertNotIn("TP1", trace_names)
 
     def test_run_bull_flag_grid_search_returns_curves_summary_and_figure(self) -> None:
         dates = pd.date_range("2025-01-01", periods=220, freq="B")

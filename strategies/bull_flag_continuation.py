@@ -34,6 +34,7 @@ class BullFlagStrategyConfig:
     min_flag_bars: int = 4
     max_flag_bars: int = 15
     max_flag_retrace_ratio: float = 0.40
+    min_flag_channel_slope_pct_per_bar: float | None = None
     max_flag_channel_slope_pct_per_bar: float = 0.008
     max_flag_width_pct: float = 0.12
 
@@ -56,8 +57,8 @@ class BullFlagStrategyConfig:
     enable_time_stop: bool = False
 
     def __post_init__(self) -> None:
-        if self.universe not in {"csi500", "hs300"}:
-            raise ValueError("universe must be either 'csi500' or 'hs300'.")
+        if self.universe not in {"csi500", "hs300", "csi1000"}:
+            raise ValueError("universe must be one of 'csi500', 'hs300', or 'csi1000'.")
         if len(self.ma_windows) != 3 or any(window < 2 for window in self.ma_windows):
             raise ValueError("ma_windows must contain exactly three integers >= 2.")
         if sorted(self.ma_windows) != list(self.ma_windows):
@@ -78,8 +79,15 @@ class BullFlagStrategyConfig:
             raise ValueError("max_flag_bars must be >= min_flag_bars.")
         if not 0 < self.max_flag_retrace_ratio < 1:
             raise ValueError("max_flag_retrace_ratio must be in (0, 1).")
-        if self.max_flag_channel_slope_pct_per_bar <= 0:
-            raise ValueError("max_flag_channel_slope_pct_per_bar must be positive.")
+        if self.max_flag_channel_slope_pct_per_bar < 0:
+            raise ValueError("max_flag_channel_slope_pct_per_bar must be non-negative.")
+        if (
+            self.min_flag_channel_slope_pct_per_bar is not None
+            and self.min_flag_channel_slope_pct_per_bar > self.max_flag_channel_slope_pct_per_bar
+        ):
+            raise ValueError(
+                "min_flag_channel_slope_pct_per_bar must be <= max_flag_channel_slope_pct_per_bar."
+            )
         if self.max_flag_width_pct <= 0:
             raise ValueError("max_flag_width_pct must be positive.")
         if not 0 < self.min_breakout_body_pct <= 1:
@@ -292,6 +300,15 @@ class BullFlagContinuationResearcher(TrendPullbackContinuationResearcher):
         intercept = float(y_mean - slope * x_mean)
         return intercept, slope
 
+    def _resolve_flag_channel_slope_bounds(self) -> tuple[float, float]:
+        upper_bound = float(self.config.max_flag_channel_slope_pct_per_bar)
+        lower_bound = (
+            float(self.config.min_flag_channel_slope_pct_per_bar)
+            if self.config.min_flag_channel_slope_pct_per_bar is not None
+            else -upper_bound
+        )
+        return lower_bound, upper_bound
+
     @staticmethod
     def _consecutive_true_run_length(series: pd.Series) -> pd.Series:
         values = series.fillna(False).to_numpy(dtype=bool)
@@ -304,6 +321,121 @@ class BullFlagContinuationResearcher(TrendPullbackContinuationResearcher):
                 run_length = 0
             output[index] = run_length
         return pd.Series(output, index=series.index, dtype="int32")
+
+    @staticmethod
+    def _rolling_ema(series: pd.Series, window: int) -> pd.Series:
+        return series.ewm(span=window, adjust=False, min_periods=window).mean()
+
+    @staticmethod
+    def _max_consecutive_true(values: np.ndarray) -> int:
+        longest = 0
+        current = 0
+        for value in np.asarray(values, dtype=bool):
+            if value:
+                current += 1
+                longest = max(longest, current)
+            else:
+                current = 0
+        return int(longest)
+
+    @staticmethod
+    def _iter_true_runs(values: np.ndarray) -> list[tuple[int, int]]:
+        runs: list[tuple[int, int]] = []
+        run_start: int | None = None
+        for index, value in enumerate(np.asarray(values, dtype=bool)):
+            if value and run_start is None:
+                run_start = index
+            elif not value and run_start is not None:
+                runs.append((run_start, index - 1))
+                run_start = None
+        if run_start is not None:
+            runs.append((run_start, len(values) - 1))
+        return runs
+
+    def _compute_narrow_state_features(self, ticker_frame: pd.DataFrame) -> dict[str, np.ndarray]:
+        row_count = len(ticker_frame)
+        state = np.zeros(row_count, dtype=bool)
+        run_length = np.zeros(row_count, dtype=np.int32)
+        bear_ratio = np.full(row_count, np.nan, dtype=float)
+        ema20_above_ratio = np.full(row_count, np.nan, dtype=float)
+        max_consecutive_bear = np.full(row_count, -1, dtype=np.int32)
+        peak_upper_shadow = np.full(row_count, np.nan, dtype=float)
+        if row_count == 0:
+            return {
+                "narrow_uptrend_state": state,
+                "narrow_uptrend_run_length": run_length,
+                "narrow_state_bear_ratio": bear_ratio,
+                "narrow_state_ema20_above_ratio": ema20_above_ratio,
+                "narrow_state_max_consecutive_bear_bars": max_consecutive_bear,
+                "narrow_state_peak_upper_shadow_pct": peak_upper_shadow,
+            }
+
+        cfg = self.config
+        lookback = cfg.narrow_trend_lookback_bars
+        open_values = pd.to_numeric(ticker_frame["open"], errors="coerce").to_numpy(dtype=float)
+        high_values = pd.to_numeric(ticker_frame["high"], errors="coerce").to_numpy(dtype=float)
+        close_values = pd.to_numeric(ticker_frame["close"], errors="coerce").to_numpy(dtype=float)
+        ema20_values = pd.to_numeric(ticker_frame["ema_20"], errors="coerce").to_numpy(dtype=float)
+        upper_shadow_values = pd.to_numeric(
+            ticker_frame["signal_upper_shadow_pct"], errors="coerce"
+        ).to_numpy(dtype=float)
+
+        bearish_bars = (
+            np.isfinite(close_values)
+            & np.isfinite(open_values)
+            & (close_values < open_values)
+        )
+        close_above_ema = (
+            np.isfinite(close_values)
+            & np.isfinite(ema20_values)
+            & (close_values > ema20_values)
+        )
+
+        for current_loc in range(lookback - 1, row_count):
+            window_start = current_loc - lookback + 1
+            high_window = high_values[window_start : current_loc + 1]
+            bear_window = bearish_bars[window_start : current_loc + 1]
+            ema_window = ema20_values[window_start : current_loc + 1]
+
+            if high_window.size != lookback or np.isnan(high_window).any():
+                continue
+
+            bear_ratio[current_loc] = float(bear_window.mean())
+            max_consecutive_bear[current_loc] = self._max_consecutive_true(bear_window)
+            if not np.isnan(ema_window).any():
+                ema20_above_ratio[current_loc] = float(close_above_ema[window_start : current_loc + 1].mean())
+            peak_upper_shadow[current_loc] = upper_shadow_values[current_loc]
+
+            highest_high_ok = bool(high_values[current_loc] >= np.nanmax(high_window))
+            bear_ratio_ok = bool(bear_ratio[current_loc] <= cfg.narrow_trend_max_bear_ratio)
+            max_consecutive_ok = bool(
+                max_consecutive_bear[current_loc] <= cfg.narrow_trend_max_consecutive_bear_bars
+            )
+            ema20_ratio_ok = bool(
+                pd.notna(ema20_above_ratio[current_loc])
+                and ema20_above_ratio[current_loc] >= cfg.narrow_trend_min_ema20_above_ratio
+            )
+            upper_shadow_ok = bool(
+                pd.notna(peak_upper_shadow[current_loc])
+                and peak_upper_shadow[current_loc] <= cfg.narrow_trend_max_upper_shadow_pct
+            )
+            state[current_loc] = (
+                highest_high_ok
+                and bear_ratio_ok
+                and max_consecutive_ok
+                and ema20_ratio_ok
+                and upper_shadow_ok
+            )
+
+        run_length = self._consecutive_true_run_length(pd.Series(state)).to_numpy(dtype=np.int32)
+        return {
+            "narrow_uptrend_state": state,
+            "narrow_uptrend_run_length": run_length,
+            "narrow_state_bear_ratio": bear_ratio,
+            "narrow_state_ema20_above_ratio": ema20_above_ratio,
+            "narrow_state_max_consecutive_bear_bars": max_consecutive_bear,
+            "narrow_state_peak_upper_shadow_pct": peak_upper_shadow,
+        }
 
     @classmethod
     def _select_flagpole_start_index(
@@ -340,6 +472,7 @@ class BullFlagContinuationResearcher(TrendPullbackContinuationResearcher):
         row_count = len(ticker_frame)
         if row_count == 0:
             return {}
+        slope_lower_bound, slope_upper_bound = self._resolve_flag_channel_slope_bounds()
 
         date_values = ticker_frame["date"].to_numpy(dtype="datetime64[ns]")
         high_values = pd.to_numeric(ticker_frame["high"], errors="coerce").to_numpy(dtype=float)
@@ -359,37 +492,147 @@ class BullFlagContinuationResearcher(TrendPullbackContinuationResearcher):
         pivot_high_indices = np.flatnonzero(pivot_high)
         pivot_low_indices = np.flatnonzero(pivot_low)
 
-        annotations: dict[str, np.ndarray] = {
-            "signal_bullish_stack_run_length": np.full(row_count, np.nan, dtype=float),
-            "signal_stack_spread_pct": np.full(row_count, np.nan, dtype=float),
-            "signal_sma20_return_5": np.full(row_count, np.nan, dtype=float),
-            "peak_bullish_stack_run_length": np.full(row_count, np.nan, dtype=float),
-            "peak_sma60_return_10": np.full(row_count, np.nan, dtype=float),
-            "flagpole_start_date": self._nat_array(row_count),
-            "flagpole_start_low": np.full(row_count, np.nan, dtype=float),
-            "flagpole_length": np.full(row_count, np.nan, dtype=float),
-            "flag_peak_date": self._nat_array(row_count),
-            "flag_peak_high": np.full(row_count, np.nan, dtype=float),
-            "flagpole_bars": self._int_array(row_count),
-            "flagpole_return": np.full(row_count, np.nan, dtype=float),
-            "flag_start_date": self._nat_array(row_count),
-            "flag_end_date": self._nat_array(row_count),
-            "flag_bars": self._int_array(row_count),
-            "flag_low_date": self._nat_array(row_count),
-            "flag_low": np.full(row_count, np.nan, dtype=float),
-            "flag_retrace_ratio": np.full(row_count, np.nan, dtype=float),
-            "flag_width_pct": np.full(row_count, np.nan, dtype=float),
-            "flag_upper_slope": np.full(row_count, np.nan, dtype=float),
-            "flag_lower_slope": np.full(row_count, np.nan, dtype=float),
-            "flag_upper_line_value": np.full(row_count, np.nan, dtype=float),
-            "flag_lower_line_value": np.full(row_count, np.nan, dtype=float),
-            "flag_shape_ok": np.zeros(row_count, dtype=bool),
-            "flag_retrace_ok": np.zeros(row_count, dtype=bool),
-            "flag_channel_ok": np.zeros(row_count, dtype=bool),
-            "bull_flag_candidate": np.zeros(row_count, dtype=bool),
-            "breakout_candle": np.zeros(row_count, dtype=bool),
-            "signal_candle": np.zeros(row_count, dtype=bool),
-        }
+        def make_empty_annotations() -> dict[str, np.ndarray]:
+            return {
+                "signal_bullish_stack_run_length": np.full(row_count, np.nan, dtype=float),
+                "signal_stack_spread_pct": np.full(row_count, np.nan, dtype=float),
+                "signal_sma20_return_5": np.full(row_count, np.nan, dtype=float),
+                "peak_bullish_stack_run_length": np.full(row_count, np.nan, dtype=float),
+                "peak_sma60_return_10": np.full(row_count, np.nan, dtype=float),
+                "flagpole_start_date": self._nat_array(row_count),
+                "flagpole_start_low": np.full(row_count, np.nan, dtype=float),
+                "flagpole_length": np.full(row_count, np.nan, dtype=float),
+                "flag_peak_date": self._nat_array(row_count),
+                "flag_peak_high": np.full(row_count, np.nan, dtype=float),
+                "flagpole_bars": self._int_array(row_count),
+                "flagpole_return": np.full(row_count, np.nan, dtype=float),
+                "flag_start_date": self._nat_array(row_count),
+                "flag_end_date": self._nat_array(row_count),
+                "flag_bars": self._int_array(row_count),
+                "flag_low_date": self._nat_array(row_count),
+                "flag_low": np.full(row_count, np.nan, dtype=float),
+                "flag_retrace_ratio": np.full(row_count, np.nan, dtype=float),
+                "flag_width_pct": np.full(row_count, np.nan, dtype=float),
+                "flag_upper_slope": np.full(row_count, np.nan, dtype=float),
+                "flag_lower_slope": np.full(row_count, np.nan, dtype=float),
+                "flag_upper_line_value": np.full(row_count, np.nan, dtype=float),
+                "flag_lower_line_value": np.full(row_count, np.nan, dtype=float),
+                "flag_shape_ok": np.zeros(row_count, dtype=bool),
+                "flag_retrace_ok": np.zeros(row_count, dtype=bool),
+                "flag_channel_ok": np.zeros(row_count, dtype=bool),
+                "bull_flag_candidate": np.zeros(row_count, dtype=bool),
+                "breakout_candle": np.zeros(row_count, dtype=bool),
+                "signal_candle": np.zeros(row_count, dtype=bool),
+            }
+
+        def record_setup(
+            target: dict[str, np.ndarray],
+            *,
+            current_loc: int,
+            flagpole_start_idx: int,
+            peak_idx: int,
+            flag_start_idx: int,
+        ) -> None:
+            if not bullish_stack[current_loc]:
+                return
+
+            flag_end_idx = current_loc - 1
+            flag_bars = int(flag_end_idx - flag_start_idx + 1)
+            if flag_bars < cfg.min_flag_bars or flag_bars > cfg.max_flag_bars:
+                return
+            if not bullish_stack[flag_start_idx : current_loc + 1].all():
+                return
+
+            flagpole_start_low = low_values[flagpole_start_idx]
+            flag_peak_high = high_values[peak_idx]
+            if (
+                pd.isna(flagpole_start_low)
+                or pd.isna(flag_peak_high)
+                or flagpole_start_low <= 0
+                or flag_peak_high <= flagpole_start_low
+            ):
+                return
+
+            flagpole_bars = int(peak_idx - flagpole_start_idx)
+            if flagpole_bars < cfg.min_flagpole_bars or flagpole_bars > cfg.max_flagpole_bars:
+                return
+
+            flagpole_return = float(flag_peak_high / flagpole_start_low - 1.0)
+            if flagpole_return < cfg.min_flagpole_return:
+                return
+
+            flag_high_window = high_values[flag_start_idx : flag_end_idx + 1]
+            flag_low_window = low_values[flag_start_idx : flag_end_idx + 1]
+            if (
+                flag_high_window.size != flag_bars
+                or flag_low_window.size != flag_bars
+                or np.isnan(flag_high_window).any()
+                or np.isnan(flag_low_window).any()
+            ):
+                return
+
+            flag_low_relative_idx = int(np.argmin(flag_low_window))
+            flag_low_idx = flag_start_idx + flag_low_relative_idx
+            flag_low = float(flag_low_window[flag_low_relative_idx])
+            denominator = float(flag_peak_high - flagpole_start_low)
+            if denominator <= 0:
+                return
+
+            flag_retrace_ratio = float((flag_peak_high - flag_low) / denominator)
+            flag_width_pct = float((flag_high_window.max() - flag_low_window.min()) / flag_peak_high)
+            upper_intercept, upper_slope = self._fit_line(flag_high_window)
+            lower_intercept, lower_slope = self._fit_line(flag_low_window)
+            upper_slope_pct = upper_slope / flag_peak_high
+            lower_slope_pct = lower_slope / flag_peak_high
+            projected_upper_line = float(upper_intercept + upper_slope * flag_bars)
+            projected_lower_line = float(lower_intercept + lower_slope * flag_bars)
+
+            flag_shape_ok = bool(flag_width_pct <= cfg.max_flag_width_pct)
+            flag_retrace_ok = bool(flag_retrace_ratio <= cfg.max_flag_retrace_ratio)
+            flag_channel_ok = bool(
+                slope_lower_bound <= upper_slope_pct <= slope_upper_bound
+                and slope_lower_bound <= lower_slope_pct <= slope_upper_bound
+            )
+            bull_flag_candidate = flag_shape_ok and flag_retrace_ok and flag_channel_ok
+            breakout_candle = bool(
+                bull_flag_candidate
+                and signal_quality_ok[current_loc]
+                and close_gt_prev_high[current_loc]
+                and pd.notna(close_values[current_loc])
+                and close_values[current_loc] > projected_upper_line
+            )
+
+            target["signal_bullish_stack_run_length"][current_loc] = bullish_stack_run_length[current_loc]
+            target["signal_stack_spread_pct"][current_loc] = stack_spread_pct[current_loc]
+            target["signal_sma20_return_5"][current_loc] = sma20_return_5[current_loc]
+            target["peak_bullish_stack_run_length"][current_loc] = bullish_stack_run_length[peak_idx]
+            target["peak_sma60_return_10"][current_loc] = sma60_return_10[peak_idx]
+            target["flagpole_start_date"][current_loc] = date_values[flagpole_start_idx]
+            target["flagpole_start_low"][current_loc] = float(flagpole_start_low)
+            target["flagpole_length"][current_loc] = float(flag_peak_high - flagpole_start_low)
+            target["flag_peak_date"][current_loc] = date_values[peak_idx]
+            target["flag_peak_high"][current_loc] = float(flag_peak_high)
+            target["flagpole_bars"][current_loc] = flagpole_bars
+            target["flagpole_return"][current_loc] = flagpole_return
+            target["flag_start_date"][current_loc] = date_values[flag_start_idx]
+            target["flag_end_date"][current_loc] = date_values[flag_end_idx]
+            target["flag_bars"][current_loc] = flag_bars
+            target["flag_low_date"][current_loc] = date_values[flag_low_idx]
+            target["flag_low"][current_loc] = flag_low
+            target["flag_retrace_ratio"][current_loc] = flag_retrace_ratio
+            target["flag_width_pct"][current_loc] = flag_width_pct
+            target["flag_upper_slope"][current_loc] = float(upper_slope)
+            target["flag_lower_slope"][current_loc] = float(lower_slope)
+            target["flag_upper_line_value"][current_loc] = projected_upper_line
+            target["flag_lower_line_value"][current_loc] = projected_lower_line
+            target["flag_shape_ok"][current_loc] = flag_shape_ok
+            target["flag_retrace_ok"][current_loc] = flag_retrace_ok
+            target["flag_channel_ok"][current_loc] = flag_channel_ok
+            target["bull_flag_candidate"][current_loc] = bull_flag_candidate
+            target["breakout_candle"][current_loc] = breakout_candle
+            target["signal_candle"][current_loc] = breakout_candle
+
+        flagpole_annotations = make_empty_annotations()
 
         for peak_idx in pivot_high_indices:
             peak_idx = int(peak_idx)
@@ -405,118 +648,22 @@ class BullFlagContinuationResearcher(TrendPullbackContinuationResearcher):
             if flagpole_start_idx is None:
                 continue
 
-            flagpole_start_low = low_values[flagpole_start_idx]
-            flag_peak_high = high_values[peak_idx]
-            if (
-                pd.isna(flagpole_start_low)
-                or pd.isna(flag_peak_high)
-                or flagpole_start_low <= 0
-                or flag_peak_high <= flagpole_start_low
-            ):
-                continue
-
-            flagpole_bars = int(peak_idx - flagpole_start_idx)
-            if flagpole_bars < cfg.min_flagpole_bars or flagpole_bars > cfg.max_flagpole_bars:
-                continue
-
-            flagpole_return = float(flag_peak_high / flagpole_start_low - 1.0)
-            if flagpole_return < cfg.min_flagpole_return:
-                continue
-
-            flagpole_length = float(flag_peak_high - flagpole_start_low)
             flag_start_idx = peak_idx + 1
             breakout_start_idx = flag_start_idx + cfg.min_flag_bars
-            breakout_end_idx = min(row_count - 1, peak_idx + cfg.max_flag_bars + 1)
+            breakout_end_idx = min(row_count - 1, flag_start_idx + cfg.max_flag_bars)
             if breakout_start_idx > breakout_end_idx:
                 continue
 
             for current_loc in range(breakout_start_idx, breakout_end_idx + 1):
-                if not bullish_stack[current_loc]:
-                    continue
-
-                flag_end_idx = current_loc - 1
-                flag_bars = int(flag_end_idx - flag_start_idx + 1)
-                if flag_bars < cfg.min_flag_bars or flag_bars > cfg.max_flag_bars:
-                    continue
-                # A bull flag is only valid while the bullish-stack regime
-                # remains intact from the peak into the breakout attempt. Once
-                # that background breaks, the old setup is considered stale
-                # even if the moving-average stack later recovers.
-                if not bullish_stack[flag_start_idx : current_loc + 1].all():
-                    continue
-
-                flag_high_window = high_values[flag_start_idx : flag_end_idx + 1]
-                flag_low_window = low_values[flag_start_idx : flag_end_idx + 1]
-                if (
-                    flag_high_window.size != flag_bars
-                    or flag_low_window.size != flag_bars
-                    or np.isnan(flag_high_window).any()
-                    or np.isnan(flag_low_window).any()
-                ):
-                    continue
-
-                flag_low_relative_idx = int(np.argmin(flag_low_window))
-                flag_low_idx = flag_start_idx + flag_low_relative_idx
-                flag_low = float(flag_low_window[flag_low_relative_idx])
-                denominator = float(flag_peak_high - flagpole_start_low)
-                if denominator <= 0:
-                    continue
-
-                flag_retrace_ratio = float((flag_peak_high - flag_low) / denominator)
-                flag_width_pct = float((flag_high_window.max() - flag_low_window.min()) / flag_peak_high)
-                upper_intercept, upper_slope = self._fit_line(flag_high_window)
-                lower_intercept, lower_slope = self._fit_line(flag_low_window)
-                upper_slope_pct = upper_slope / flag_peak_high
-                lower_slope_pct = lower_slope / flag_peak_high
-                projected_upper_line = float(upper_intercept + upper_slope * flag_bars)
-                projected_lower_line = float(lower_intercept + lower_slope * flag_bars)
-
-                flag_shape_ok = bool(flag_width_pct <= cfg.max_flag_width_pct)
-                flag_retrace_ok = bool(flag_retrace_ratio <= cfg.max_flag_retrace_ratio)
-                flag_channel_ok = bool(
-                    abs(upper_slope_pct) <= cfg.max_flag_channel_slope_pct_per_bar
-                    and abs(lower_slope_pct) <= cfg.max_flag_channel_slope_pct_per_bar
-                )
-                bull_flag_candidate = flag_shape_ok and flag_retrace_ok and flag_channel_ok
-                breakout_candle = bool(
-                    bull_flag_candidate
-                    and signal_quality_ok[current_loc]
-                    and close_gt_prev_high[current_loc]
-                    and pd.notna(close_values[current_loc])
-                    and close_values[current_loc] > projected_upper_line
+                record_setup(
+                    flagpole_annotations,
+                    current_loc=current_loc,
+                    flagpole_start_idx=flagpole_start_idx,
+                    peak_idx=peak_idx,
+                    flag_start_idx=flag_start_idx,
                 )
 
-                annotations["signal_bullish_stack_run_length"][current_loc] = bullish_stack_run_length[current_loc]
-                annotations["signal_stack_spread_pct"][current_loc] = stack_spread_pct[current_loc]
-                annotations["signal_sma20_return_5"][current_loc] = sma20_return_5[current_loc]
-                annotations["peak_bullish_stack_run_length"][current_loc] = bullish_stack_run_length[peak_idx]
-                annotations["peak_sma60_return_10"][current_loc] = sma60_return_10[peak_idx]
-                annotations["flagpole_start_date"][current_loc] = date_values[flagpole_start_idx]
-                annotations["flagpole_start_low"][current_loc] = float(flagpole_start_low)
-                annotations["flagpole_length"][current_loc] = flagpole_length
-                annotations["flag_peak_date"][current_loc] = date_values[peak_idx]
-                annotations["flag_peak_high"][current_loc] = float(flag_peak_high)
-                annotations["flagpole_bars"][current_loc] = flagpole_bars
-                annotations["flagpole_return"][current_loc] = flagpole_return
-                annotations["flag_start_date"][current_loc] = date_values[flag_start_idx]
-                annotations["flag_end_date"][current_loc] = date_values[flag_end_idx]
-                annotations["flag_bars"][current_loc] = flag_bars
-                annotations["flag_low_date"][current_loc] = date_values[flag_low_idx]
-                annotations["flag_low"][current_loc] = flag_low
-                annotations["flag_retrace_ratio"][current_loc] = flag_retrace_ratio
-                annotations["flag_width_pct"][current_loc] = flag_width_pct
-                annotations["flag_upper_slope"][current_loc] = float(upper_slope)
-                annotations["flag_lower_slope"][current_loc] = float(lower_slope)
-                annotations["flag_upper_line_value"][current_loc] = projected_upper_line
-                annotations["flag_lower_line_value"][current_loc] = projected_lower_line
-                annotations["flag_shape_ok"][current_loc] = flag_shape_ok
-                annotations["flag_retrace_ok"][current_loc] = flag_retrace_ok
-                annotations["flag_channel_ok"][current_loc] = flag_channel_ok
-                annotations["bull_flag_candidate"][current_loc] = bull_flag_candidate
-                annotations["breakout_candle"][current_loc] = breakout_candle
-                annotations["signal_candle"][current_loc] = breakout_candle
-
-        return annotations
+        return flagpole_annotations
 
     def add_features(self) -> pd.DataFrame:
         if self._has_columns(self.FEATURE_COLUMNS):
@@ -530,7 +677,6 @@ class BullFlagContinuationResearcher(TrendPullbackContinuationResearcher):
             df[f"sma_{window}"] = ticker_group["close"].transform(
                 lambda series, current_window=window: self._rolling_sma(series, current_window)
             )
-
         fast_window, mid_window, slow_window = cfg.ma_windows
         df["bullish_stack"] = (
             df[f"sma_{fast_window}"].gt(df[f"sma_{mid_window}"])
@@ -840,6 +986,28 @@ class BullFlagContinuationResearcher(TrendPullbackContinuationResearcher):
         )
         return candidates.loc[:, output_columns].reset_index(drop=True)
 
+    def _is_live_candidate_row(self, signal_row: pd.Series) -> bool:
+        if signal_row.empty:
+            return False
+        is_candidate = (
+            bool(signal_row.get("signal_candle", False))
+            and bool(signal_row.get("follow_through_confirmed", False))
+            and bool(signal_row.get("reward_to_risk_ok", False))
+        )
+        if self.config.require_follow_through_close_gt_signal_close:
+            is_candidate = is_candidate and bool(signal_row.get("follow_through_close_gt_signal_close", False))
+        return is_candidate
+
+    @staticmethod
+    def _resolve_planned_entry_date(ticker_frame: pd.DataFrame, follow_through_date: pd.Timestamp | object) -> pd.Timestamp | pd.NaT:
+        if pd.isna(follow_through_date):
+            return pd.NaT
+        follow_through_date = pd.Timestamp(follow_through_date)
+        future_dates = ticker_frame.loc[ticker_frame["date"].gt(follow_through_date), "date"]
+        if not future_dates.empty:
+            return pd.Timestamp(future_dates.iloc[0])
+        return follow_through_date + pd.offsets.BDay(1)
+
     def monitor_positions(
         self,
         positions_df: pd.DataFrame,
@@ -1037,6 +1205,7 @@ class BullFlagContinuationResearcher(TrendPullbackContinuationResearcher):
             raise ValueError("lookback and lookahead must be non-negative.")
 
         self._ensure_research_outcomes()
+        cfg = self.config
         target_date = pd.to_datetime(signal_date)
         ticker = str(ticker)
         scored = self._sort_for_calculation(self.stock_candle_df.copy())
@@ -1048,16 +1217,48 @@ class BullFlagContinuationResearcher(TrendPullbackContinuationResearcher):
         if signal_rows.empty:
             raise ValueError(f"Ticker '{ticker}' does not have data on {target_date.date()}.")
 
-        executed_rows = signal_rows[signal_rows["entry_signal_executed"]]
+        review_mode = "executed"
+        executed_rows = signal_rows[signal_rows["entry_signal_executed"].fillna(False)]
         if executed_rows.empty:
-            if bool(signal_rows["entry_signal_suppressed"].fillna(False).any()):
+            live_candidate_rows = signal_rows[signal_rows.apply(self._is_live_candidate_row, axis=1)]
+            if live_candidate_rows.empty:
+                if bool(signal_rows["entry_signal_suppressed"].fillna(False).any()):
+                    raise ValueError(
+                        f"Ticker '{ticker}' on {target_date.date()} was a suppressed signal, not an executed entry."
+                    )
                 raise ValueError(
-                    f"Ticker '{ticker}' on {target_date.date()} was a suppressed signal, not an executed entry."
+                    f"Ticker '{ticker}' does not have an executed signal or live candidate on {target_date.date()}."
                 )
-            raise ValueError(f"Ticker '{ticker}' does not have an executed signal on {target_date.date()}.")
-
-        signal_row = executed_rows.iloc[[0]].copy().reset_index(drop=True)
+            signal_row = live_candidate_rows.iloc[[0]].copy().reset_index(drop=True)
+            review_mode = "live_candidate"
+        else:
+            signal_row = executed_rows.iloc[[0]].copy().reset_index(drop=True)
         signal_loc = int(ticker_frame.index[ticker_frame["date"] == target_date][0])
+        planned_entry_date = self._resolve_planned_entry_date(ticker_frame, signal_row["follow_through_date"].iat[0])
+        planned_entry_price = (
+            float(signal_row["entry_reference_price"].iat[0])
+            if "entry_reference_price" in signal_row.columns and pd.notna(signal_row["entry_reference_price"].iat[0])
+            else (
+                float(signal_row["follow_through_close"].iat[0])
+                if "follow_through_close" in signal_row.columns and pd.notna(signal_row["follow_through_close"].iat[0])
+                else np.nan
+            )
+        )
+        planned_hard_stop_price = (
+            float(signal_row["signal_hard_stop_price"].iat[0])
+            if "signal_hard_stop_price" in signal_row.columns and pd.notna(signal_row["signal_hard_stop_price"].iat[0])
+            else np.nan
+        )
+        planned_take_profit_price = (
+            float(signal_row["signal_take_profit_price"].iat[0])
+            if "signal_take_profit_price" in signal_row.columns and pd.notna(signal_row["signal_take_profit_price"].iat[0])
+            else np.nan
+        )
+        signal_row["review_mode"] = review_mode
+        signal_row["planned_entry_date"] = planned_entry_date
+        signal_row["planned_entry_price"] = planned_entry_price
+        signal_row["planned_hard_stop_price"] = planned_hard_stop_price
+        signal_row["planned_take_profit_price"] = planned_take_profit_price
         exit_date = signal_row["exit_date_next"].iat[0] if "exit_date_next" in signal_row.columns else pd.NaT
         if pd.notna(exit_date):
             exit_locs = ticker_frame.index[ticker_frame["date"] == exit_date]
@@ -1072,6 +1273,7 @@ class BullFlagContinuationResearcher(TrendPullbackContinuationResearcher):
         price_window["follow_through_marker"] = price_window["date"].eq(signal_row["follow_through_date"].iat[0])
         price_window["entry_marker"] = price_window["date"].eq(signal_row["entry_date_next"].iat[0])
         price_window["exit_marker"] = price_window["date"].eq(signal_row["exit_date_next"].iat[0])
+        price_window["planned_entry_marker"] = price_window["date"].eq(planned_entry_date)
 
         checklist = pd.DataFrame(
             {
@@ -1117,11 +1319,16 @@ class BullFlagContinuationResearcher(TrendPullbackContinuationResearcher):
         )
 
         summary = {
+            "review_mode": review_mode,
             "ticker": ticker,
             "signal_date": target_date,
             "follow_through_date": signal_row["follow_through_date"].iat[0],
             "raw_signal": bool(signal_row["signal_candle"].iat[0]),
             "executed_signal": bool(signal_row["entry_signal_executed"].iat[0]),
+            "planned_entry_date": planned_entry_date,
+            "planned_entry_price": planned_entry_price,
+            "planned_hard_stop_price": planned_hard_stop_price,
+            "planned_take_profit_price": planned_take_profit_price,
             "flagpole_start_date": signal_row["flagpole_start_date"].iat[0],
             "flag_peak_date": signal_row["flag_peak_date"].iat[0],
             "flag_start_date": signal_row["flag_start_date"].iat[0],
@@ -1197,6 +1404,7 @@ class BullFlagContinuationResearcher(TrendPullbackContinuationResearcher):
             "follow_through_high",
             "follow_through_close",
             "follow_through_close_gt_signal_close",
+            "entry_reference_price",
             "signal_stack_spread_ok",
             "signal_sma20_return_ok",
             "peak_sma60_return_ok",
@@ -1204,6 +1412,11 @@ class BullFlagContinuationResearcher(TrendPullbackContinuationResearcher):
             "reward_to_risk",
             "signal_take_profit_price",
             "signal_hard_stop_price",
+            "planned_entry_date",
+            "planned_entry_price",
+            "planned_hard_stop_price",
+            "planned_take_profit_price",
+            "review_mode",
             "entry_signal",
             "entry_signal_executed",
             "entry_signal_suppressed",
@@ -1306,6 +1519,7 @@ class BullFlagContinuationResearcher(TrendPullbackContinuationResearcher):
             )
 
         signal_date_value = pd.Timestamp(signal_row["date"].iat[0])
+        review_mode = str(inspection["summary"].get("review_mode", "executed"))
         flagpole_start_date = signal_row["flagpole_start_date"].iat[0]
         flag_peak_date = signal_row["flag_peak_date"].iat[0]
         flag_start_date = signal_row["flag_start_date"].iat[0]
@@ -1316,6 +1530,22 @@ class BullFlagContinuationResearcher(TrendPullbackContinuationResearcher):
         exit_date = signal_row["exit_date_next"].iat[0]
         stop_price = signal_row["signal_hard_stop_price"].iat[0]
         target_price = signal_row["signal_take_profit_price"].iat[0]
+        planned_entry_date = inspection["summary"].get("planned_entry_date", pd.NaT)
+        planned_entry_price = inspection["summary"].get("planned_entry_price", np.nan)
+        planned_stop_price = inspection["summary"].get("planned_hard_stop_price", np.nan)
+        planned_target_price = inspection["summary"].get("planned_take_profit_price", np.nan)
+
+        def marker_y(date_value: pd.Timestamp | object, price_column: str, fallback_column: str) -> float:
+            if pd.isna(date_value):
+                return np.nan
+            matching_rows = price_window[price_window["date"].eq(pd.Timestamp(date_value))]
+            if matching_rows.empty:
+                return np.nan
+            if price_column in matching_rows.columns and pd.notna(matching_rows[price_column].iat[0]):
+                return float(matching_rows[price_column].iat[0])
+            if fallback_column in matching_rows.columns and pd.notna(matching_rows[fallback_column].iat[0]):
+                return float(matching_rows[fallback_column].iat[0])
+            return np.nan
 
         if pd.notna(flagpole_start_date) and pd.notna(signal_row["flagpole_start_low"].iat[0]):
             figure.add_trace(
@@ -1406,14 +1636,57 @@ class BullFlagContinuationResearcher(TrendPullbackContinuationResearcher):
         figure.add_vline(x=signal_date_value, line_dash="dash", line_color="royalblue", row=1, col=1)
         if pd.notna(follow_through_date):
             figure.add_vline(x=follow_through_date, line_dash="dot", line_color="darkgreen", row=1, col=1)
-        if pd.notna(entry_date):
-            figure.add_vline(x=entry_date, line_dash="dot", line_color="mediumpurple", row=1, col=1)
-        if pd.notna(exit_date):
-            figure.add_vline(x=exit_date, line_dash="dot", line_color="gray", row=1, col=1)
-        if pd.notna(stop_price):
-            figure.add_hline(y=stop_price, line_dash="dot", line_color="indianred", row=1, col=1)
-        if pd.notna(target_price):
-            figure.add_hline(y=target_price, line_dash="dot", line_color="seagreen", row=1, col=1)
+        if review_mode == "executed":
+            if pd.notna(entry_date):
+                figure.add_vline(x=entry_date, line_dash="dot", line_color="mediumpurple", row=1, col=1)
+            if pd.notna(exit_date):
+                figure.add_vline(x=exit_date, line_dash="dot", line_color="gray", row=1, col=1)
+            if pd.notna(stop_price):
+                figure.add_hline(y=stop_price, line_dash="dot", line_color="indianred", row=1, col=1)
+            if pd.notna(target_price):
+                figure.add_hline(y=target_price, line_dash="dot", line_color="seagreen", row=1, col=1)
+        else:
+            line_start = pd.Timestamp(price_window["date"].iat[0])
+            line_end = pd.Timestamp(planned_entry_date) if pd.notna(planned_entry_date) else pd.Timestamp(price_window["date"].iat[-1])
+            if pd.notna(planned_entry_date) and pd.notna(planned_entry_price):
+                figure.add_trace(
+                    go.Scatter(
+                        x=[planned_entry_date],
+                        y=[planned_entry_price],
+                        mode="markers+text",
+                        marker=dict(size=12, symbol="diamond", color="mediumpurple"),
+                        text=["Planned Entry"],
+                        textposition="top right",
+                        name="Planned Entry",
+                    ),
+                    row=1,
+                    col=1,
+                )
+                figure.add_vline(x=planned_entry_date, line_dash="dot", line_color="mediumpurple", row=1, col=1)
+            if pd.notna(planned_stop_price):
+                figure.add_trace(
+                    go.Scatter(
+                        x=[line_start, line_end],
+                        y=[planned_stop_price, planned_stop_price],
+                        mode="lines",
+                        line=dict(color="indianred", width=1.4, dash="dot"),
+                        name="Planned Hard Stop",
+                    ),
+                    row=1,
+                    col=1,
+                )
+            if pd.notna(planned_target_price):
+                figure.add_trace(
+                    go.Scatter(
+                        x=[line_start, line_end],
+                        y=[planned_target_price, planned_target_price],
+                        mode="lines",
+                        line=dict(color="seagreen", width=1.4, dash="dot"),
+                        name="Planned Take Profit",
+                    ),
+                    row=1,
+                    col=1,
+                )
 
         for column, name, color in [
             ("flagpole_return", "Flagpole Return", "firebrick"),

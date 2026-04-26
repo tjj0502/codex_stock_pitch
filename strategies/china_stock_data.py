@@ -35,6 +35,12 @@ PRICE_COLUMNS = [
 INDEX_UNIVERSE_CONFIG = {
     "000905.SH": {"universe": "csi500", "label": "CSI500"},
     "000300.SH": {"universe": "hs300", "label": "HS300"},
+    "000852.SH": {"universe": "csi1000", "label": "CSI1000"},
+}
+ALL_A_UNIVERSE_METADATA = {
+    "index_code": "ALL_A",
+    "universe": "all_a",
+    "index_label": "All A Shares",
 }
 
 
@@ -71,6 +77,126 @@ def _index_metadata(index_code: str) -> dict[str, str]:
 def _empty_price_frame() -> pd.DataFrame:
     """Return an empty frame that still matches the project-wide candle schema."""
     return pd.DataFrame(columns=PRICE_COLUMNS)
+
+
+def _fetch_member_prices_for_constituents(
+    constituents: pd.DataFrame,
+    *,
+    metadata: dict[str, str],
+    sd: DateLike,
+    ed: DateLike,
+    token: str | None = None,
+    pause_seconds: float = 1.3,
+    max_calls_per_minute: int = 195,
+) -> pd.DataFrame:
+    """Fetch QFQ-adjusted daily bars for an already-resolved constituent snapshot."""
+    start_date = _normalize_date(sd)
+    end_date = _normalize_date(ed)
+    client = _get_tushare_client(token=token)
+
+    frames: list[pd.DataFrame] = []
+    failed_tickers: list[str] = []
+    window_started_at = time.monotonic()
+    calls_in_window = 0
+
+    for _, row in constituents.iterrows():
+        if max_calls_per_minute > 0 and calls_in_window >= max_calls_per_minute:
+            elapsed = time.monotonic() - window_started_at
+            if elapsed < 60:
+                time.sleep(60 - elapsed)
+            window_started_at = time.monotonic()
+            calls_in_window = 0
+
+        try:
+            price_df = ts.pro_bar(
+                api=client,
+                ts_code=row["ts_code"],
+                start_date=start_date,
+                end_date=end_date,
+                asset="E",
+                adj="qfq",
+            )
+            calls_in_window += 1
+        except Exception as exc:
+            message = str(exc)
+            if "50" in message:
+                time.sleep(65)
+                window_started_at = time.monotonic()
+                calls_in_window = 0
+                try:
+                    price_df = ts.pro_bar(
+                        api=client,
+                        ts_code=row["ts_code"],
+                        start_date=start_date,
+                        end_date=end_date,
+                        asset="E",
+                        adj="qfq",
+                    )
+                    calls_in_window += 1
+                except Exception:
+                    failed_tickers.append(row["ticker"])
+                    continue
+            else:
+                failed_tickers.append(row["ticker"])
+                continue
+
+        if price_df is None or price_df.empty:
+            if pause_seconds > 0:
+                time.sleep(pause_seconds)
+            continue
+
+        price_df = price_df.rename(
+            columns={
+                "trade_date": "date",
+                "vol": "volume",
+                "amount": "turnover",
+                "pct_chg": "change_pct",
+                "change": "change_amount",
+            }
+        )
+        price_df["date"] = pd.to_datetime(price_df["date"], format="%Y%m%d")
+        price_df["ticker"] = row["ticker"]
+        price_df["name"] = row["name"]
+        price_df["weight"] = row["weight"]
+        price_df["constituent_trade_date"] = row["trade_date"]
+        price_df["amplitude_pct"] = (
+            (price_df["high"] - price_df["low"]) / price_df["pre_close"] * 100
+        )
+        frames.append(price_df)
+        if pause_seconds > 0:
+            time.sleep(pause_seconds)
+
+    if not frames:
+        empty_df = _empty_price_frame()
+        empty_df.attrs.update(
+            {
+                "failed_tickers": failed_tickers,
+                "price_adjustment": "qfq",
+                "index_code": metadata["index_code"],
+                "universe": metadata["universe"],
+                "index_label": metadata["index_label"],
+                "constituent_history_mode": "latest_snapshot",
+            }
+        )
+        if "constituent_trade_date" in constituents.attrs:
+            empty_df.attrs["constituent_trade_date"] = constituents.attrs["constituent_trade_date"]
+        return empty_df
+
+    result = pd.concat(frames, ignore_index=True)
+    result = result[PRICE_COLUMNS].sort_values(["date", "ticker"], ignore_index=True)
+    result.attrs.update(
+        {
+            "failed_tickers": failed_tickers,
+            "price_adjustment": "qfq",
+            "index_code": metadata["index_code"],
+            "universe": metadata["universe"],
+            "index_label": metadata["index_label"],
+            "constituent_history_mode": "latest_snapshot",
+        }
+    )
+    if "constituent_trade_date" in constituents.attrs:
+        result.attrs["constituent_trade_date"] = constituents.attrs["constituent_trade_date"]
+    return result
 
 
 def get_index_constituents(
@@ -170,6 +296,72 @@ def get_hs300_constituents(
         start_date=start_date,
         end_date=end_date,
     )
+
+
+def get_csi1000_constituents(
+    token: str | None = None,
+    start_date: DateLike | None = None,
+    end_date: DateLike | None = None,
+) -> pd.DataFrame:
+    """Convenience wrapper for the CSI 1000 latest constituent snapshot."""
+    return get_index_constituents(
+        "000852.SH",
+        token=token,
+        start_date=start_date,
+        end_date=end_date,
+    )
+
+
+def get_all_a_share_constituents(
+    token: str | None = None,
+    end_date: DateLike | None = None,
+) -> pd.DataFrame:
+    """
+    Fetch the latest listed A-share snapshot as a simple full-universe member list.
+
+    The snapshot uses currently listed mainland equities from ``stock_basic`` and
+    applies that same universe to the whole historical price window, so
+    survivorship bias still exists by construction.
+    """
+    client = _get_tushare_client(token=token)
+    resolved_end = _normalize_date(end_date or pd.Timestamp.today().date())
+    stock_basic = client.stock_basic(
+        exchange="",
+        list_status="L",
+        fields="ts_code,symbol,name,list_date",
+    )
+    if stock_basic.empty:
+        empty = pd.DataFrame(columns=["ticker", "ts_code", "name", "trade_date", "weight", "list_date"])
+        empty.attrs.update(
+            {
+                "index_code": ALL_A_UNIVERSE_METADATA["index_code"],
+                "universe": ALL_A_UNIVERSE_METADATA["universe"],
+                "index_label": ALL_A_UNIVERSE_METADATA["index_label"],
+                "constituent_history_mode": "latest_snapshot",
+                "constituent_trade_date": resolved_end,
+            }
+        )
+        return empty
+
+    stock_basic = stock_basic.copy()
+    stock_basic = stock_basic[stock_basic["ts_code"].str.endswith((".SH", ".SZ", ".BJ"))].copy()
+    stock_basic["ticker"] = stock_basic["symbol"].astype("string")
+    stock_basic["trade_date"] = resolved_end
+    stock_basic["weight"] = 1.0
+    result = stock_basic[
+        ["ticker", "ts_code", "name", "trade_date", "weight", "list_date"]
+    ].drop_duplicates(subset=["ts_code"], keep="first")
+    result = result.sort_values(["ticker"], kind="mergesort", ignore_index=True)
+    result.attrs.update(
+        {
+            "index_code": ALL_A_UNIVERSE_METADATA["index_code"],
+            "universe": ALL_A_UNIVERSE_METADATA["universe"],
+            "index_label": ALL_A_UNIVERSE_METADATA["index_label"],
+            "constituent_history_mode": "latest_snapshot",
+            "constituent_trade_date": resolved_end,
+        }
+    )
+    return result
 
 
 def get_trade_calendar(
@@ -280,116 +472,15 @@ def get_index_member_prices(
         start_date=pd.Timestamp(end_date) - pd.Timedelta(days=31),
         end_date=end_date,
     )
-    client = _get_tushare_client(token=token)
-
-    frames: list[pd.DataFrame] = []
-    failed_tickers: list[str] = []
-    window_started_at = time.monotonic()
-    calls_in_window = 0
-
-    for _, row in constituents.iterrows():
-        if max_calls_per_minute > 0 and calls_in_window >= max_calls_per_minute:
-            elapsed = time.monotonic() - window_started_at
-            if elapsed < 60:
-                time.sleep(60 - elapsed)
-            window_started_at = time.monotonic()
-            calls_in_window = 0
-
-        try:
-            # Each constituent is fetched independently so partial failures do
-            # not abort the full universe download.
-            price_df = ts.pro_bar(
-                api=client,
-                ts_code=row["ts_code"],
-                start_date=start_date,
-                end_date=end_date,
-                asset="E",
-                adj="qfq",
-            )
-            calls_in_window += 1
-        except Exception as exc:
-            message = str(exc)
-            if "50" in message:
-                # Tushare occasionally signals per-minute throttling in the
-                # error message. Retry once after a cool-down window.
-                time.sleep(65)
-                window_started_at = time.monotonic()
-                calls_in_window = 0
-                try:
-                    price_df = ts.pro_bar(
-                        api=client,
-                        ts_code=row["ts_code"],
-                        start_date=start_date,
-                        end_date=end_date,
-                        asset="E",
-                        adj="qfq",
-                    )
-                    calls_in_window += 1
-                except Exception:
-                    failed_tickers.append(row["ticker"])
-                    continue
-            else:
-                failed_tickers.append(row["ticker"])
-                continue
-
-        if price_df.empty:
-            if pause_seconds > 0:
-                time.sleep(pause_seconds)
-            continue
-
-        # Align Tushare's field names with the candle schema used everywhere
-        # else in the repo so scorers/backtesters can consume the result
-        # without special-case logic.
-        price_df = price_df.rename(
-            columns={
-                "trade_date": "date",
-                "vol": "volume",
-                "amount": "turnover",
-                "pct_chg": "change_pct",
-                "change": "change_amount",
-            }
-        )
-        price_df["date"] = pd.to_datetime(price_df["date"], format="%Y%m%d")
-        price_df["ticker"] = row["ticker"]
-        price_df["name"] = row["name"]
-        price_df["weight"] = row["weight"]
-        price_df["constituent_trade_date"] = row["trade_date"]
-        price_df["amplitude_pct"] = (
-            (price_df["high"] - price_df["low"]) / price_df["pre_close"] * 100
-        )
-        frames.append(price_df)
-        if pause_seconds > 0:
-            time.sleep(pause_seconds)
-
-    if not frames:
-        empty_df = _empty_price_frame()
-        empty_df.attrs.update(
-            {
-                "failed_tickers": failed_tickers,
-                "price_adjustment": "qfq",
-                "index_code": index_code,
-                "universe": metadata["universe"],
-                "index_label": metadata["index_label"],
-                "constituent_history_mode": "latest_snapshot",
-            }
-        )
-        return empty_df
-
-    result = pd.concat(frames, ignore_index=True)
-    result = result[PRICE_COLUMNS].sort_values(["date", "ticker"], ignore_index=True)
-    result.attrs.update(
-        {
-            "failed_tickers": failed_tickers,
-            "price_adjustment": "qfq",
-            "index_code": index_code,
-            "universe": metadata["universe"],
-            "index_label": metadata["index_label"],
-            "constituent_history_mode": "latest_snapshot",
-        }
+    return _fetch_member_prices_for_constituents(
+        constituents,
+        metadata=metadata,
+        sd=sd,
+        ed=ed,
+        token=token,
+        pause_seconds=pause_seconds,
+        max_calls_per_minute=max_calls_per_minute,
     )
-    if "constituent_trade_date" in constituents.attrs:
-        result.attrs["constituent_trade_date"] = constituents.attrs["constituent_trade_date"]
-    return result
 
 
 def get_csi500_member_prices(
@@ -443,6 +534,44 @@ def get_hs300_member_prices(
     """Convenience wrapper for HS300 QFQ-adjusted member prices."""
     return get_index_member_prices(
         "000300.SH",
+        sd=sd,
+        ed=ed,
+        token=token,
+        pause_seconds=pause_seconds,
+        max_calls_per_minute=max_calls_per_minute,
+    )
+
+
+def get_csi1000_member_prices(
+    sd: DateLike,
+    ed: DateLike,
+    token: str | None = None,
+    pause_seconds: float = 1.3,
+    max_calls_per_minute: int = 195,
+) -> pd.DataFrame:
+    """Convenience wrapper for CSI1000 QFQ-adjusted member prices."""
+    return get_index_member_prices(
+        "000852.SH",
+        sd=sd,
+        ed=ed,
+        token=token,
+        pause_seconds=pause_seconds,
+        max_calls_per_minute=max_calls_per_minute,
+    )
+
+
+def get_all_a_share_member_prices(
+    sd: DateLike,
+    ed: DateLike,
+    token: str | None = None,
+    pause_seconds: float = 1.3,
+    max_calls_per_minute: int = 195,
+) -> pd.DataFrame:
+    """Fetch QFQ-adjusted daily prices for the latest listed A-share universe."""
+    constituents = get_all_a_share_constituents(token=token, end_date=ed)
+    return _fetch_member_prices_for_constituents(
+        constituents,
+        metadata=ALL_A_UNIVERSE_METADATA,
         sd=sd,
         ed=ed,
         token=token,

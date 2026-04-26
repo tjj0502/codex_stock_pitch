@@ -854,6 +854,26 @@ class BullFlagDynamicExitResearcherBase(BullFlagContinuationResearcher):
                 signal_row[column] = source_row[column].to_numpy()
         inspection["signal_row"] = signal_row
 
+        if str(inspection["summary"].get("review_mode", "executed")) != "executed":
+            inspection["exit_path"] = pd.DataFrame()
+            summary = dict(inspection["summary"])
+            summary.update(
+                {
+                    "dynamic_exit_variant": self.STRATEGY_NAME,
+                    "tp1_price": np.nan,
+                    "tp1_reached": False,
+                    "tp1_hit_date": pd.NaT,
+                    "post_tp1_stop_price": np.nan,
+                    "ma_trail_value": np.nan,
+                    "structure_trail_value": np.nan,
+                    "relative_volume_20_signal": np.nan,
+                    "highest_close_since_tp1": np.nan,
+                    "close_retrace_threshold": np.nan,
+                }
+            )
+            inspection["summary"] = summary
+            return inspection
+
         ticker_frame = scored[scored["ticker"].astype(str).eq(str(ticker))].reset_index(drop=True)
         signal_loc = int(ticker_frame.index[ticker_frame["date"] == target_date][0])
         simulation = self._simulate_exit_state(
@@ -893,6 +913,8 @@ class BullFlagDynamicExitResearcherBase(BullFlagContinuationResearcher):
     ) -> go.Figure:
         figure = super().plot_signal_context(ticker, signal_date, lookback=lookback, lookahead=lookahead)
         inspection = self.inspect_signal(ticker, signal_date, lookback=lookback, lookahead=lookahead)
+        if str(inspection["summary"].get("review_mode", "executed")) != "executed":
+            return figure
         signal_row = inspection["signal_row"]
         price_window = inspection["price_window"].copy()
         exit_path = inspection.get("exit_path", pd.DataFrame()).copy()
@@ -945,7 +967,6 @@ class BullFlagDynamicExitResearcherBase(BullFlagContinuationResearcher):
 
         for column, name, color in [
             ("ema_10", "EMA 10", "darkgreen"),
-            ("ema_20", "EMA 20", "teal"),
         ]:
             if column in price_window.columns and price_window[column].notna().any():
                 figure.add_trace(
