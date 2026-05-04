@@ -1399,3 +1399,2000 @@
     - trailing 的松紧
     - 是否要在 stop-only 里保留某种弱形式的保护阈值
 - 如果后续 stop-only 能把 `sharpe` 也拉回来，再考虑把它升级成新的主推荐版本
+
+## 第 13 轮：只做负斜率 flag，以及 slope 区间 grid search（`Dataframes/stock_price2.csv`）
+
+本轮做了什么：
+
+- 这轮只研究 bull flag 旗面的 slope 方向，不改 entry 其余部分，也不改当前主线的 trailing exit。
+- 数据明确改成了：`Dataframes/stock_price2.csv`
+- 研究问题分两步：
+  1. 如果只做负斜率 flag，也就是把 slope 限定在 `-0.008` 到 `0`，结果会不会更好
+  2. 如果把 slope 上下界继续放宽或收紧，是否能找到更好的区间
+
+改了哪些代码：
+
+- 在 [bull_flag_continuation.py](/C:/Users/Jay/GitRepo/codex_stock_pitch/strategies/bull_flag_continuation.py) 里新增了 `min_flag_channel_slope_pct_per_bar`
+- 旗面 slope 过滤从“对称绝对值限制”改成了“上下界区间限制”
+  - 旧逻辑等价于：`[-max_slope, +max_slope]`
+  - 新逻辑可以直接表达：
+    - 只做负斜率：`[-0.008, 0]`
+    - 轻微负到小幅正：`[-0.008, 0.004]`
+- 这样做以后，默认配置仍兼容旧行为，但我们终于可以明确测试“负斜率限定”到底有没有价值
+
+补了哪些测试：
+
+- 默认对称 slope 限制下，轻微正斜率仍然允许通过
+- 当 slope 区间限制为 `[-0.008, 0]` 时，同样的轻微正斜率 setup 会被拒绝
+
+统一回测口径：
+
+- 数据：`Dataframes/stock_price2.csv`
+- 股票池：`csi500`
+- 区间：`2020-01-02` 到 `2026-03-16`
+- 其余固定参数：
+  - `max_flag_retrace_ratio = 0.30`
+  - `min_breakout_body_pct = 0.60`
+  - `max_breakout_upper_shadow_pct = 0.35`
+  - `max_breakout_lower_shadow_pct = 0.50`
+  - `max_peak_sma60_return_10 = 0.055`
+  - `tp1_fraction_of_target = 0.50`
+  - `trailing_stop_fraction_of_flagpole = 0.25`
+
+本轮 grid：
+
+- 负斜率限定：
+  - `[-0.004, 0]`
+  - `[-0.006, 0]`
+  - `[-0.008, 0]`
+  - `[-0.010, 0]`
+  - `[-0.012, 0]`
+- 放宽正斜率容忍：
+  - `[-0.008, 0.002]`
+  - `[-0.008, 0.004]`
+  - `[-0.008, 0.008]`（当前旧默认等价口径）
+
+关键结果：
+
+| slope 区间 | 计划交易数 | 胜率 | 平均单笔收益 | Profit Factor | Sharpe | 最大回撤 | 总收益 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `[-0.008, 0.004]` | 129 | 60.63% | 3.03% | 2.3884 | 1.3521 | 0.86% | 6.96% |
+| `[-0.008, 0.008]` | 165 | 59.26% | 2.67% | 2.1445 | 1.2386 | 1.02% | 7.84% |
+| `[-0.008, 0.002]` | 98 | 57.73% | 2.34% | 1.9910 | 0.9350 | 1.27% | 3.88% |
+| `[-0.004, 0]` | 47 | 54.35% | 1.56% | 1.6302 | 0.4131 | 1.18% | 1.07% |
+| `[-0.006, 0]` | 55 | 50.00% | 1.25% | 1.4750 | 0.3661 | 1.47% | 1.00% |
+| `[-0.008, 0]` | 68 | 52.24% | 1.43% | 1.5426 | 0.4525 | 1.78% | 1.49% |
+| `[-0.010, 0]` | 75 | 47.30% | 0.57% | 1.1644 | 0.1413 | 2.29% | 0.47% |
+| `[-0.012, 0]` | 78 | 48.05% | 0.69% | 1.1957 | 0.1811 | 2.17% | 0.64% |
+
+归档输出：
+
+- 全部结果表：[slope_grid_stock_price2.csv](/C:/Users/Jay/GitRepo/codex_stock_pitch/strategy_archive/bull_flag_continuation/experiment_logs/outputs/slope_grid_stock_price2.csv)
+
+结论：
+
+1. **只做负斜率 flag，这条路在 `stock_price2.csv` 上并不好。**
+   - 你提的核心版本 `[-0.008, 0]` 计划交易数只剩 `68`
+   - `profit_factor = 1.5426`
+   - `sharpe = 0.4525`
+   - `total_return = 1.49%`
+   - 和当前对称默认 `[-0.008, 0.008]` 比，质量和收益都明显更差
+
+2. **把正斜率完全禁掉，会误杀太多本来有用的 setup。**
+   - 这说明我们之前担心的事情是真实存在的：
+     - 日线里不少肉眼看起来接近横盘的旗面，拟合后会带一点轻微正斜率
+     - 如果把正斜率一刀切掉，会把这些其实仍然合理的 continuation setup 一起杀掉
+
+3. **最好的 tested 区间不是“纯负”，而是“轻微负到小幅正”。**
+   - 本轮最优是：`[-0.008, 0.004]`
+   - 它相比当前对称默认 `[-0.008, 0.008]`：
+     - `profit_factor`：`2.1445 -> 2.3884`
+     - `sharpe`：`1.2386 -> 1.3521`
+     - `max_drawdown`：`1.02% -> 0.86%`
+   - 代价是：
+     - `planned_trade_count`：`165 -> 129`
+     - `total_return`：`7.84% -> 6.96%`
+
+4. **因此当前最合理的理解是：**
+   - 旗面 slope 不该像旧版那样允许到 `+0.008` 那么宽
+   - 但也不该严格收成纯负
+   - 一个更像“高质量 refinement”的区间，是：
+     - `min_flag_channel_slope_pct_per_bar = -0.008`
+     - `max_flag_channel_slope_pct_per_bar = 0.004`
+
+当前阶段结论：
+
+- 如果更看重：
+  - `profit_factor`
+  - `sharpe`
+  - `max_drawdown`
+  那本轮最值得继续用的是：`[-0.008, 0.004]`
+- 如果更看重原始总收益和样本量，当前对称默认 `[-0.008, 0.008]` 仍然更激进
+- 但“只做负斜率 flag”这条 thesis，在 `Dataframes/stock_price2.csv` 上**没有得到支持**
+
+下一步计划：
+
+- 先把这轮结论保留成一个明确分支口径：
+  - 主版本：保留当前对称默认
+  - 高质量备选版：`[-0.008, 0.004]`
+- 如果后面继续细挖 slope，我更倾向于：
+  - 围绕 `0.002 ~ 0.006` 这段小正斜率容忍区间再做一轮更细的网格
+  - 而不是继续往“纯负斜率”方向收紧
+
+## 第 14 轮：`Dataframes/csi_1000_stock_price2.csv` 多轮迭代研究
+
+本轮做了什么：
+
+- 这轮把研究对象从之前的 `stock_price.csv / stock_price2.csv` 切到：
+  - `Dataframes/csi_1000_stock_price2.csv`
+- 目标不是追求频率，而是按你要求去提高 `profit_factor / sharpe`
+- 执行纪律固定为：
+  - 每一轮只动一个参数
+  - 每轮最多跑 3 个回测点
+  - 每轮先总结，再决定下一轮
+
+补充的小代码改动：
+
+- 在 [bull_flag_continuation.py](/C:/Users/Jay/GitRepo/codex_stock_pitch/strategies/bull_flag_continuation.py) 里把 `BullFlagStrategyConfig.universe` 放宽到支持 `csi1000`
+- 这样这轮实验配置和数据标签可以对齐，不需要再用 `csi500` 假扮 `csi1000`
+
+统一回测口径：
+
+- 数据：`Dataframes/csi_1000_stock_price2.csv`
+- 股票池：`csi1000`
+- 区间：`2020-01-02` 到 `2026-03-16`
+- 资金口径：
+  - `initial_capital=1,000,000`
+  - `fixed_entry_notional=20,000`
+  - `board_lot_size=100`
+
+### Round 0：当前主线 baseline
+
+参数：
+
+- `max_flag_retrace_ratio = 0.30`
+- `min_flag_channel_slope_pct_per_bar = -0.008`
+- `max_flag_channel_slope_pct_per_bar = 0.008`
+- `min_breakout_body_pct = 0.60`
+- `max_breakout_upper_shadow_pct = 0.35`
+- `max_breakout_lower_shadow_pct = 0.50`
+- `max_peak_sma60_return_10 = 0.055`
+- `tp1_fraction_of_target = 0.50`
+- `trailing_stop_fraction_of_flagpole = 0.25`
+- exit：`BullFlagTrailingAfterTp1Researcher`
+
+结果：
+
+- `planned_trade_count = 263`
+- `trade_win_rate = 45.21%`
+- `average_trade_return = 0.07%`
+- `profit_factor = 1.0419`
+- `sharpe = 0.0766`
+- `max_drawdown = 5.24%`
+- `total_return = 0.66%`
+
+结论：
+
+- 这版在 csi1000 上**不能直接用**
+- 频率是有的，但质量太差，说明小盘股环境下必须把 flag 和 signal 收得更干净
+
+归档输出：
+
+- [csi1000_baseline_bull_flag_trailing.csv](/C:/Users/Jay/GitRepo/codex_stock_pitch/strategy_archive/bull_flag_continuation/experiment_logs/outputs/csi1000_baseline_bull_flag_trailing.csv)
+
+### Round 1：Flag 深度（`max_flag_retrace_ratio`）
+
+grid：
+
+- `0.20 / 0.25 / 0.30`
+
+结果：
+
+| `max_flag_retrace_ratio` | 计划交易数 | 胜率 | 平均单笔收益 | Profit Factor | Sharpe | 最大回撤 | 总收益 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `0.20` | 59 | 42.37% | -0.12% | 1.0113 | 0.0146 | 2.20% | 0.04% |
+| `0.25` | 119 | 47.86% | 1.06% | 1.3516 | 0.4136 | 1.94% | 2.45% |
+| `0.30` | 263 | 45.21% | 0.07% | 1.0419 | 0.0766 | 5.24% | 0.66% |
+
+结论：
+
+- csi1000 上旗面不能太深
+- `0.25` 明显优于 `0.30`
+- `0.20` 又收得过头，频率和收益都掉得太多
+
+归档输出：
+
+- [csi1000_round1_flag_retrace_grid.csv](/C:/Users/Jay/GitRepo/codex_stock_pitch/strategy_archive/bull_flag_continuation/experiment_logs/outputs/csi1000_round1_flag_retrace_grid.csv)
+
+### Round 2：Flag slope 上界（固定 `retrace=0.25`）
+
+grid：
+
+- `max_flag_channel_slope_pct_per_bar = 0.0 / 0.004 / 0.008`
+- 固定下界：
+  - `min_flag_channel_slope_pct_per_bar = -0.008`
+
+结果：
+
+| slope 上界 | 计划交易数 | 胜率 | 平均单笔收益 | Profit Factor | Sharpe | 最大回撤 | 总收益 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `0.000` | 48 | 54.17% | 2.61% | 2.0389 | 0.7345 | 0.55% | 2.49% |
+| `0.004` | 96 | 49.47% | 1.62% | 1.5594 | 0.5933 | 1.81% | 2.93% |
+| `0.008` | 119 | 47.86% | 1.06% | 1.3516 | 0.4136 | 1.94% | 2.45% |
+
+结论：
+
+- 这一轮和 csi500 的结论不同
+- 在 csi1000 上，**纯负/横盘旗面更好**
+- `slope_upper = 0` 明显提升了：
+  - `profit_factor`
+  - `sharpe`
+  - `max_drawdown`
+- 虽然 `0.004` 的总收益略高，但质量指标整体不如 `0`
+
+归档输出：
+
+- [csi1000_round2_slope_upper_grid.csv](/C:/Users/Jay/GitRepo/codex_stock_pitch/strategy_archive/bull_flag_continuation/experiment_logs/outputs/csi1000_round2_slope_upper_grid.csv)
+
+### Round 3：Signal K 实体（固定 `retrace=0.25`, `slope_upper=0`）
+
+grid：
+
+- `min_breakout_body_pct = 0.50 / 0.60 / 0.70`
+
+结果：
+
+| `min_breakout_body_pct` | 计划交易数 | 胜率 | 平均单笔收益 | Profit Factor | Sharpe | 最大回撤 | 总收益 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `0.50` | 56 | 55.36% | 2.65% | 2.1749 | 0.8399 | 0.62% | 2.92% |
+| `0.60` | 48 | 54.17% | 2.61% | 2.0389 | 0.7345 | 0.55% | 2.49% |
+| `0.70` | 32 | 56.25% | 1.48% | 1.5729 | 0.3591 | 0.82% | 0.91% |
+
+结论：
+
+- csi1000 上 signal K 的实体也不宜过度苛刻
+- `0.50` 比 `0.60/0.70` 更平衡
+- `0.70` 样本太少，且单笔赚钱厚度反而下降
+
+归档输出：
+
+- [csi1000_round3_signal_body_grid.csv](/C:/Users/Jay/GitRepo/codex_stock_pitch/strategy_archive/bull_flag_continuation/experiment_logs/outputs/csi1000_round3_signal_body_grid.csv)
+
+### Round 4：退出方法（固定当前最优 entry）
+
+固定 entry：
+
+- `max_flag_retrace_ratio = 0.25`
+- `min_flag_channel_slope_pct_per_bar = -0.008`
+- `max_flag_channel_slope_pct_per_bar = 0.0`
+- `min_breakout_body_pct = 0.50`
+- `max_breakout_upper_shadow_pct = 0.35`
+- `max_breakout_lower_shadow_pct = 0.50`
+- `max_peak_sma60_return_10 = 0.055`
+
+对比版本：
+
+- `BullFlagTrailingAfterTp1Researcher`
+- `BullFlagTrailingStopOnlyAfterTp1Researcher`
+- `BullFlagStructureTrailAfterTp1Researcher`
+
+结果：
+
+| 退出版本 | 计划交易数 | 胜率 | 平均单笔收益 | Profit Factor | Sharpe | 最大回撤 | 总收益 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `trailing_default` | 56 | 55.36% | 2.65% | 2.1749 | 0.8399 | 0.62% | 2.92% |
+| `trailing_stop_only_after_tp1` | 56 | 55.36% | 2.51% | 2.1126 | 0.7712 | 0.62% | 2.76% |
+| `structure_trail` | 56 | 50.00% | 3.17% | 2.2680 | 0.8679 | 0.87% | 3.45% |
+
+结论：
+
+- 在 csi1000 上，止盈/移动止损这层最优不是默认 trailing，而是 **structure trail**
+- 它的特点是：
+  - 胜率低一点
+  - 但平均单笔收益更厚
+  - `profit_factor` 和 `sharpe` 都是三者里最好
+  - `total_return` 也最高
+- `TP1` 后纯止损这次没有跑赢默认 trailing
+
+归档输出：
+
+- [csi1000_round4_exit_variants.csv](/C:/Users/Jay/GitRepo/codex_stock_pitch/strategy_archive/bull_flag_continuation/experiment_logs/outputs/csi1000_round4_exit_variants.csv)
+
+### 额外说明
+
+- 中间原本想补一轮 `max_breakout_upper_shadow_pct` 的 grid，但上一轮执行中断过一次
+- 这次为了避免继续卡死，我没有再重复跑这一轮
+- 因为前 4 轮已经足够形成清晰结论：
+  - flag 要更浅
+  - slope 要更纯负/横盘
+  - body 不要太苛刻
+  - exit 用 structure trail 更优
+
+## 当前阶段总结（`Dataframes/csi_1000_stock_price2.csv`）
+
+在 csi1000 上，当前最值得保留的 bull flag 配置是：
+
+- `max_flag_retrace_ratio = 0.25`
+- `min_flag_channel_slope_pct_per_bar = -0.008`
+- `max_flag_channel_slope_pct_per_bar = 0.0`
+- `min_breakout_body_pct = 0.50`
+- `max_breakout_upper_shadow_pct = 0.35`
+- `max_breakout_lower_shadow_pct = 0.50`
+- `max_peak_sma60_return_10 = 0.055`
+- exit：`BullFlagStructureTrailAfterTp1Researcher`
+
+这版相对原始 baseline 的改善非常明显：
+
+- `profit_factor`：`1.0419 -> 2.2680`
+- `sharpe`：`0.0766 -> 0.8679`
+- `max_drawdown`：`5.24% -> 0.87%`
+- `total_return`：`0.66% -> 3.45%`
+
+最后的判断：
+
+1. **csi1000 可以做 bull flag，但不能直接沿用 csi500 的宽松主线。**
+2. **小盘股上，flag 要更浅、形态要更纯，signal K 反而不需要过度完美。**
+3. **退出层比我预期得更重要：**
+   - csi1000 上结构性 trail 比默认 trailing 更适合把盈亏比拉起来
+
+下一步计划：
+
+- 如果后面继续深挖 csi1000，我优先会看两件事：
+  1. `max_breakout_upper_shadow_pct` 的小范围 grid（例如 `0.25 / 0.35 / 0.45`）
+  2. `structure_trail_lookback` 的小范围 grid（例如 `3 / 5 / 8`）
+
+## 第 15 轮：`Dataframes/csi_1000_stock_price2.csv` baseline 亏损结构复盘
+
+### 本轮做了什么
+
+- 不再继续调参，转而专门复盘 csi1000 baseline 的亏损结构。
+- 研究对象固定为：
+  - 数据源：`Dataframes/csi_1000_stock_price2.csv`
+  - entry / exit：最原始 baseline，也就是：
+    - `max_flag_retrace_ratio = 0.30`
+    - `min_flag_channel_slope_pct_per_bar = -0.008`
+    - `max_flag_channel_slope_pct_per_bar = 0.008`
+    - `min_breakout_body_pct = 0.60`
+    - `max_breakout_upper_shadow_pct = 0.35`
+    - `max_breakout_lower_shadow_pct = 0.50`
+    - `max_peak_sma60_return_10 = 0.055`
+    - exit：`BullFlagTrailingAfterTp1Researcher`
+- 为了和回测指标严格一致，这次只统计 `2020-01-01` 到 `2026-03-16` 窗口内的 closed trades，不混入更早历史样本。
+
+### 关键结果
+
+- `closed_trade_count = 262`
+- `loss_trade_count = 143`
+- `loss_rate = 54.58%`
+
+亏损单退出原因：
+
+- `hard_stop = 134`
+- `trailing_stop = 8`
+- `take_profit = 1`
+
+`TP1` 命中率对比：
+
+- 亏损单 `tp1_reached_rate = 6.29%`
+- 盈利单 `tp1_reached_rate = 98.32%`
+
+这说明 baseline 最大的问题不是“TP1 后怎么拿”，而是：
+
+- **大多数亏损单在到达 `TP1` 之前就已经失败了**
+- **也就是 entry / setup 质量不过关，而不是动态止盈来不及救**
+
+### baseline 亏损更像死在哪里
+
+一句话总结：
+
+- **baseline 主要死在“入场后很快走坏，直接打原始硬止损”**
+
+这和后面几轮优化得到的方向是完全一致的：
+
+- csi1000 先要解决的是 setup 纯度
+- 不是先去堆更复杂的 trailing / stop-only 花样
+
+### 特征上看到了什么
+
+#### 1. 更深的 flag 明显更差
+
+按 `flag_retrace_ratio` 三分桶：
+
+- 最浅桶：`win_rate = 44.83%`，`mean_return = +0.89%`
+- 中间桶：`win_rate = 48.86%`，`mean_return = -0.09%`
+- 最深桶：`win_rate = 42.53%`，`mean_return = -0.25%`
+
+结论：
+
+- baseline 里 `0.30` 的 flag 深度放得太松了
+- 这正是后面把 `max_flag_retrace_ratio` 收到 `0.25` 后质量明显改善的根因
+
+#### 2. slope 越接近正，越差
+
+按 `flag_upper_slope` 三分桶：
+
+- 更负的桶：`win_rate = 47.13%`，`mean_return = +0.94%`
+- 中间桶：`win_rate = 44.83%`，`mean_return = -0.16%`
+- 更高/带正斜率的桶：`win_rate = 44.32%`，`mean_return = -0.23%`
+
+结论：
+
+- csi1000 的 bull flag 更像“要纯负或横盘偏负”，不适合放到正斜率
+- 这和后面 slope grid 的最佳结果 `[-0.008, 0.0]` 一致
+
+#### 3. signal K 不是越强越好
+
+按 `signal_body_pct` 三分桶：
+
+- 较低实体桶：`win_rate = 47.73%`，`mean_return = +0.81%`
+- 中间实体桶：`win_rate = 42.53%`，`mean_return = -0.34%`
+- 最高实体桶：`win_rate = 45.98%`，`mean_return = +0.07%`
+
+结论：
+
+- baseline 里并不是“大实体 breakout”自动更好
+- 这解释了为什么后面 `min_breakout_body_pct = 0.50` 会优于 `0.60 / 0.70`
+
+#### 4. 名义上的高 R 不代表更好
+
+按 `reward_to_risk` 三分桶：
+
+- 低 R 桶：`win_rate = 42.53%`，`mean_return = -1.96%`
+- 中 R 桶：`win_rate = 55.17%`，`mean_return = +2.14%`
+- 高 R 桶：`win_rate = 38.64%`，`mean_return = +0.37%`
+
+结论：
+
+- csi1000 baseline 里，超高的账面赔率很多是“看起来很美”
+- 真正最好的是中等 R，不是越大越好
+- 这说明仅靠 `reward_to_risk` 不能挑出最干净的 setup
+
+#### 5. 过热背景也在拖后腿
+
+按 `peak_sma60_return_10` 三分桶：
+
+- 低热度桶：`mean_return = +0.10%`
+- 中热度桶：`mean_return = +0.81%`
+- 高热度桶：`mean_return = -0.34%`
+
+结论：
+
+- csi1000 上太热的 flag peak 更容易是假动作
+- 中等热度比过热更健康
+
+### 最差亏损样本的共性
+
+最差几笔基本都有这些共同点：
+
+- `exit_reason` 几乎都是 `hard_stop`
+- `tp1_reached = False`
+- `flag_retrace_ratio` 多数落在 `0.25 ~ 0.30`
+- 有些 slope 明显为正，或者至少不够负
+- signal K 肉眼看并不差，甚至实体还挺强
+
+这很关键，因为它说明：
+
+- baseline 的失败不是“信号 K 太丑”
+- 而是 **很多 setup 看起来像 breakout，但本质不是高质量 continuation**
+
+### 本轮结论
+
+这轮 baseline 亏损复盘把前面多轮调参的方向基本坐实了：
+
+1. **csi1000 的 baseline 主要死在 entry 前端，而不是 TP1 后管理。**
+2. **最值钱的改进不是继续堆 exit complexity，而是先收紧 setup：**
+   - flag 更浅
+   - slope 更纯负
+   - 不要迷信超强 body
+   - 不要迷信超高 nominal R
+3. **这也解释了为什么最后 csi1000 上是 `structure_trail` 胜出：**
+   - 前端先提纯
+   - 后端再用更适合小盘波动的结构性 trail 去保利润
+
+### 下一步计划
+
+- 如果后面继续深挖 csi1000 bull flag，我会优先看：
+  1. `max_breakout_upper_shadow_pct` 的小范围 grid
+  2. `structure_trail_lookback` / `structure_trail_buffer_pct` 的小范围 grid
+- 但在当前阶段，关于 baseline 为什么差，已经有足够清晰的结论，不需要再继续扩样本做更大范围 brute-force。
+
+## 2026-04-22：`narrow_state` 全历史漏斗诊断（`csi_1000_stock_price2.csv`）
+
+本轮做了什么：
+
+- 使用 [csi_1000_stock_price2.csv](C:/Users/Jay/GitRepo/codex_stock_pitch/Dataframes/csi_1000_stock_price2.csv) 全历史数据
+- 固定：
+  - `left_trend_mode = "narrow_state"`
+  - `narrow_trend_lookback_bars = 20`
+  - 当前默认窄趋势参数：
+    - `narrow_trend_max_bear_ratio = 0.25`
+    - `narrow_trend_max_consecutive_bear_bars = 2`
+    - `narrow_trend_min_ema20_above_ratio = 0.90`
+    - `narrow_trend_max_upper_shadow_pct = 0.25`
+    - `narrow_trend_min_run_bars = 1`
+- 直接统计 `narrow_state -> flag -> breakout -> follow-through -> entry` 的漏斗，不再只看最终回测结果
+
+结果：
+
+- `raw_state_bars = 4350`
+- `run_end_events = 3090`
+- `flag_structured_rows = 156`
+- `flag_retrace_ok_rows = 35`
+- `flag_channel_ok_rows = 27`
+- `bull_flag_candidate_rows = 2`
+- `signal_candle_rows = 0`
+- `follow_through_rows = 0`
+- `entry_signal_rows = 0`
+
+关键比例：
+
+- `flag_structured / run_end = 5.05%`
+- `bull_flag_candidate / flag_structured = 1.28%`
+- `signal_candle / bull_flag_candidate = 0%`
+
+耗时：
+
+- 读 CSV：`8.242s`
+- researcher 初始化：`515.542s`
+- 总耗时：`523.784s`
+
+结论：
+
+- 之前关于“阴线比例放到 25% 后，`narrow_state` 会有 3000+ 个事件”的判断是对的。
+- 现在的主要问题不是 `narrow_state` 本身没频率，而是 **`run-end -> 能形成合格 flag` 这一层几乎全部死掉了**。
+- 也就是说，矛盾不在左侧状态频率，而在：
+  - `narrow_state` 与当前 `flag` 定义的衔接方式
+  - 以及当前 `flag` 本体对这种左侧入口过于苛刻
+- 这也解释了为什么全历史完整回测最终是 `0` 笔交易：不是没有左侧趋势，而是左侧趋势几乎无法转化为合格 bull flag。
+
+下一步计划：
+
+- 优先研究 `narrow_state` 结束点与 `flag_start / flag_peak` 的衔接定义
+- 其次再看 `flag` 本体是否需要为 `narrow_state` 模式单独放宽，而不是直接复用旧 `flagpole` 口径
+
+### 补充：`run_end -> structured` 具体死因拆解
+
+本轮做了什么：
+
+- 在同一套 `narrow_state + N=20 + csi1000 全历史` 条件下
+- 继续把 `run_end_events -> flag_structured_rows` 这一段拆成具体失败原因
+- 同时把 `structured -> candidate / signal` 也拆开看
+
+结果：
+
+- 总体：
+  - `run_end_events = 3090`
+  - `structured_rows = 156`
+  - `candidate_rows = 2`
+  - `signal_rows = 0`
+
+- `run_end -> structured` 失败原因：
+  - `peak_not_in_bullish_stack = 1582`
+  - `flagpole_bars_out_of_range = 1480`
+  - `invalid_flagpole_low_or_peak = 10`
+  - `flag_window_breaks_bullish_stack = 3`
+  - `no_valid_flag_bars_window = 1`
+  - `no_bar_after_state_end = 1`
+
+- `structured -> next stage` 失败原因：
+  - `fail_retrace = 7`
+  - `fail_channel = 3`
+  - `fail_shape = 1`
+  - `candidate_no_breakout_signal = 1`
+
+结论：
+
+- 现在最大的瓶颈不是 `flag_retrace_ratio`、也不是 breakout K 本身。
+- 真正的问题是：**新 `narrow_state` 入口仍然在复用旧 `flagpole` 前置门槛。**
+- 具体有两层：
+  1. 很多 `run_end` 本身不在 `bullish_stack` 里，直接在入口被杀掉。
+  2. `narrow_state` 的 run 通常很短，但当前代码仍要求：
+     - `flagpole_bars` 在 `5~20`
+     - 这导致大量 run-end 在“还没进入 flag 本体”之前就被旧 `flagpole_bars` 规则过滤。
+- 一旦真正进入 `structured` 阶段，后面的主要问题才轮到：
+  - 回撤太深
+  - channel 不合格
+- 但这些已经是次级矛盾，因为前面两层先杀掉了绝大多数样本。
+
+当前判断：
+
+- 这版 `narrow_state` 失败，不是因为左侧窄趋势定义没用。
+- 而是因为 **`narrow_state` 只是换了左侧入口，但 `record_setup()` 里仍然按旧 `flagpole` 的 bar 数和 stack 逻辑在裁它。**
+- 如果后面继续改，第一优先级应该是：
+  - 给 `narrow_state` 单独定义左侧 impulse 长度门槛
+  - 而不是继续沿用旧 `min_flagpole_bars / max_flagpole_bars`
+
+## 2026-04-22：独立窄趋势策略 baseline（`csi_1000_stock_price2.csv`）
+
+本轮做了什么：
+
+- 不改 notebook / archive，只在策略层完成拆分后，先跑一圈新独立策略：
+  - `BullFlagNarrowTrendContinuationResearcher`
+- 数据源明确使用：
+  - [csi_1000_stock_price2.csv](C:/Users/Jay/GitRepo/codex_stock_pitch/Dataframes/csi_1000_stock_price2.csv)
+- baseline 参数口径：
+  - `universe = "csi1000"`
+  - `narrow_trend_lookback_bars = 20`
+  - `narrow_trend_max_bear_ratio = 0.25`
+  - `narrow_trend_max_consecutive_bear_bars = 2`
+  - `narrow_trend_min_ema20_above_ratio = 0.90`
+  - `narrow_trend_max_upper_shadow_pct = 0.25`
+  - `narrow_trend_min_run_bars = 1`
+- 其余 bull flag / 出场保持默认静态版，不叠动态 exit variant
+- 回测参数延用前面的统一口径：
+  - `initial_capital = 1,000,000`
+  - `fixed_entry_notional = 20,000`
+  - `board_lot_size = 100`
+
+输出文件：
+
+- baseline 汇总：
+  - [csi1000_narrow_trend_baseline_summary.csv](C:/Users/Jay/GitRepo/codex_stock_pitch/strategy_archive/bull_flag_continuation/experiment_logs/outputs/csi1000_narrow_trend_baseline_summary.csv)
+- 和旧 csi1000 baseline 对照：
+  - [csi1000_narrow_trend_vs_old_baseline.csv](C:/Users/Jay/GitRepo/codex_stock_pitch/strategy_archive/bull_flag_continuation/experiment_logs/outputs/csi1000_narrow_trend_vs_old_baseline.csv)
+
+结果：
+
+- 新独立窄趋势 baseline：
+  - `planned_trade_count = 96`
+  - `entered_trade_count = 96`
+  - `closed_trade_count = 96`
+  - `trade_win_rate = 37.50%`
+  - `average_trade_return = 1.2427%`
+  - `profit_factor = 1.2726`
+  - `sharpe = 0.2586`
+  - `max_drawdown = 2.76%`
+  - `total_return = 2.39%`
+
+- 跑完一圈的耗时：
+  - 读 CSV：`3.29s`
+  - researcher：`400.65s`
+  - backtester：`3.36s`
+  - 总耗时：`407.31s`
+  - 也就是大约 **6 分 47 秒**
+
+和旧 `csi1000` baseline 对照：
+
+- 旧 baseline（`BullFlagTrailingAfterTp1Researcher`）：
+  - `planned_trade_count = 263`
+  - `trade_win_rate = 45.21%`
+  - `average_trade_return = 0.0739%`
+  - `profit_factor = 1.0419`
+  - `sharpe = 0.0766`
+  - `max_drawdown = 5.24%`
+  - `total_return = 0.66%`
+
+结论：
+
+- 新独立窄趋势 baseline 虽然频率明显更低：
+  - `263 -> 96`
+- 但质量已经明显提升：
+  - `profit_factor: 1.04 -> 1.27`
+  - `sharpe: 0.08 -> 0.26`
+  - `max_drawdown: 5.24% -> 2.76%`
+  - `total_return: 0.66% -> 2.39%`
+- 这说明“把左侧 trend purity 单独抽出来”这条方向是对的。
+- 但这版仍然只是 baseline，还远远不是最优：
+  - 胜率还不高
+  - `profit_factor` 也还没有到我们前面更成熟版本的水平
+  - researcher 速度依然偏慢，主要时间还是花在特征和 signal 生成，不是 backtester
+
+当前判断：
+
+- 新独立窄趋势策略是**值得继续研究**的。
+- 它至少已经证明：
+  - 去掉旧 `bullish_stack` 入口约束
+  - 把 `flagpole_start` 改成 `run_end` 回看最低 pivot low / 最低点
+  这两件事合起来，不会把策略打坏，反而比旧 csi1000 baseline 更健康。
+
+下一步计划：
+
+- 先不急着改 exit。
+- 下一轮优先做小范围 grid：
+  1. `narrow_trend_lookback_bars = 12 / 16 / 20`
+  2. `max_flag_retrace_ratio = 0.25 / 0.30 / 0.35`
+  3. 视结果再决定要不要接动态 exit variant
+
+## 2026-04-22：独立窄趋势策略漏斗分析（`csi_1000_stock_price2.csv`）
+
+本轮做了什么：
+
+- 继续使用新独立策略 baseline：
+  - `BullFlagNarrowTrendContinuationResearcher`
+- 数据源仍然是：
+  - [csi_1000_stock_price2.csv](C:/Users/Jay/GitRepo/codex_stock_pitch/Dataframes/csi_1000_stock_price2.csv)
+- 参数口径和 baseline 保持一致：
+  - `narrow_trend_lookback_bars = 20`
+  - `narrow_trend_max_bear_ratio = 0.25`
+  - `narrow_trend_max_consecutive_bear_bars = 2`
+  - `narrow_trend_min_ema20_above_ratio = 0.90`
+  - `narrow_trend_max_upper_shadow_pct = 0.25`
+  - `narrow_trend_min_run_bars = 1`
+- 这轮不再看收益，专门看：
+  - `narrow_state -> flag -> breakout -> follow-through -> entry`
+  这条链路到底死在哪一层
+
+输出文件：
+
+- run 级漏斗：
+  - [csi1000_narrow_trend_funnel_runs.csv](C:/Users/Jay/GitRepo/codex_stock_pitch/strategy_archive/bull_flag_continuation/experiment_logs/outputs/csi1000_narrow_trend_funnel_runs.csv)
+- 唯一行漏斗：
+  - [csi1000_narrow_trend_funnel_unique_rows.csv](C:/Users/Jay/GitRepo/codex_stock_pitch/strategy_archive/bull_flag_continuation/experiment_logs/outputs/csi1000_narrow_trend_funnel_unique_rows.csv)
+- run 级失败原因：
+  - [csi1000_narrow_trend_funnel_failures.csv](C:/Users/Jay/GitRepo/codex_stock_pitch/strategy_archive/bull_flag_continuation/experiment_logs/outputs/csi1000_narrow_trend_funnel_failures.csv)
+
+### Run 级漏斗
+
+- `raw_state_bars = 4350`
+- `run_end_events = 3090`
+- `run_has_bar_after_state_end = 3089`
+- `run_has_flag_window = 3088`
+- `run_has_flagpole_anchor = 3088`
+- `run_flagpole_geometry_ok = 3088`
+- `run_flagpole_bars_ok = 3036`
+- `run_flagpole_return_ok = 2764`
+- `run_with_structured_flag_row = 2764`
+- `run_with_candidate_row = 736`
+- `run_with_breakout_row = 274`
+- `run_with_follow_through_row = 202`
+- `run_with_entry_row = 103`
+
+关键比例：
+
+- `run_end -> flagpole_return_ok = 2764 / 3090 = 89.4%`
+- `flagpole_return_ok -> candidate = 736 / 2764 = 26.6%`
+- `candidate -> breakout = 274 / 736 = 37.2%`
+- `breakout -> follow_through = 202 / 274 = 73.7%`
+- `follow_through -> entry = 103 / 202 = 51.0%`
+
+### 唯一行漏斗
+
+- `unique_structured_rows = 27238`
+- `unique_candidate_rows = 3116`
+- `unique_signal_candle_rows = 289`
+- `unique_follow_through_rows = 215`
+- `unique_entry_signal_rows = 103`
+- `unique_entry_signal_executed_rows = 96`
+- `unique_entry_signal_suppressed_rows = 7`
+
+### 失败原因
+
+run 级最主要失败原因是：
+
+- `flagpole_return_too_small = 272`
+- `flagpole_bars_out_of_range = 52`
+- `no_bar_after_state_end = 1`
+- `no_valid_flag_window = 1`
+
+### 结论
+
+这轮最重要的认识是：
+
+- 现在**不是** `narrow_state` 本身没频率。
+- 也**不是** `run_end -> flagpole` 这层在卡死样本。
+
+和之前老的 `narrow_state` 接法不同，这次独立策略已经把左侧入口打通了：
+
+- `3090` 个 run-end 里，
+- 有 `2764` 个能走到 `flagpole_return_ok`
+
+也就是说：
+
+- **左侧入口已经基本不是主矛盾。**
+
+现在真正掉频率最快的地方，已经变成了两层：
+
+1. **`flagpole_return_ok -> candidate`**
+   - `2764 -> 736`
+   - 这里掉了约 `73%`
+   - 说明真正的主瓶颈已经转移到：
+     - `flag_retrace_ratio`
+     - `flag_width_pct`
+     - `flag channel slope`
+   - 也就是 **flag 本体太严 / 和这类左侧入口不够匹配**
+
+2. **`candidate -> breakout`**
+   - `736 -> 274`
+   - 这里又掉了约 `63%`
+   - 说明第二个瓶颈是：
+     - 当前 breakout 定义
+     - `signal_quality_ok`
+     - `close > projected_upper_line`
+   - 对这类窄趋势入口来说依然比较苛刻
+
+后面两层反而没有前面那么夸张：
+
+- `breakout -> follow_through` 还保留了 `73.7%`
+- `follow_through -> entry` 掉到 `103`，主要是：
+  - `reward_to_risk`
+  - `trend_environment_ok`
+  在继续过滤
+- 最后 `103 -> 96` 只是计划单层面对重叠信号做了压缩，不是核心问题
+
+当前判断：
+
+- 这次拆出来的新窄趋势策略已经证明：
+  - 左侧入口方向是对的
+  - 现在真正值得调的，不再是 `narrow_state` 自己
+- 下一轮最值得动的是：
+  1. `max_flag_retrace_ratio`
+  2. `min_flag_channel_slope_pct_per_bar / max_flag_channel_slope_pct_per_bar`
+  3. breakout bar 的质量门槛
+
+一句话总结：
+
+- **当前频率掉得最快的地方，不在左侧 trend detection，而在 flag 本体和 breakout 这两层。**
+
+## 2026-04-23：独立窄趋势策略小范围 grid（`csi_1000_stock_price2.csv`）
+
+本轮做了什么：
+
+- 继续基于新独立策略 baseline：
+  - `BullFlagNarrowTrendContinuationResearcher`
+- 数据源仍然是：
+  - [csi_1000_stock_price2.csv](C:/Users/Jay/GitRepo/codex_stock_pitch/Dataframes/csi_1000_stock_price2.csv)
+- 按“每轮只动一个参数、每轮不超过 3 个回测”的原则，连续跑了 3 轮：
+  1. `max_flag_retrace_ratio`
+  2. `max_flag_width_pct`
+  3. `flag channel slope upper bound`
+
+输出文件：
+
+- Round 1：
+  - [csi1000_narrow_round1_retrace_grid.csv](C:/Users/Jay/GitRepo/codex_stock_pitch/strategy_archive/bull_flag_continuation/experiment_logs/outputs/csi1000_narrow_round1_retrace_grid.csv)
+- Round 2：
+  - [csi1000_narrow_round2_width_grid.csv](C:/Users/Jay/GitRepo/codex_stock_pitch/strategy_archive/bull_flag_continuation/experiment_logs/outputs/csi1000_narrow_round2_width_grid.csv)
+- Round 3：
+  - [csi1000_narrow_round3_slope_grid.csv](C:/Users/Jay/GitRepo/codex_stock_pitch/strategy_archive/bull_flag_continuation/experiment_logs/outputs/csi1000_narrow_round3_slope_grid.csv)
+- 汇总表：
+  - [csi1000_narrow_flag_grid_summary.csv](C:/Users/Jay/GitRepo/codex_stock_pitch/strategy_archive/bull_flag_continuation/experiment_logs/outputs/csi1000_narrow_flag_grid_summary.csv)
+
+### Round 1：`max_flag_retrace_ratio`
+
+固定：
+
+- `narrow_trend_lookback_bars = 20`
+- `narrow_trend_max_bear_ratio = 0.25`
+- `narrow_trend_min_run_bars = 1`
+- 其余先用 baseline
+
+结果：
+
+- `0.25`
+  - `planned_trade_count = 45`
+  - `profit_factor = 1.9793`
+  - `sharpe = 0.5654`
+  - `max_drawdown = 0.93%`
+  - `total_return = 3.29%`
+
+- `0.30`
+  - `planned_trade_count = 62`
+  - `profit_factor = 1.7828`
+  - `sharpe = 0.5262`
+  - `max_drawdown = 1.35%`
+  - `total_return = 3.86%`
+
+- `0.40`（baseline）
+  - `planned_trade_count = 96`
+  - `profit_factor = 1.2726`
+  - `sharpe = 0.2586`
+  - `max_drawdown = 2.76%`
+  - `total_return = 2.39%`
+
+结论：
+
+- **`flag_retrace_ratio` 是目前最值钱的前端参数。**
+- 只要把 `0.40` 收到 `0.25 / 0.30`，质量立刻明显抬高。
+- 如果更偏质量：
+  - `0.25` 最好
+- 如果更想保一点频率和总收益：
+  - `0.30` 更平衡
+
+### Round 2：`max_flag_width_pct`
+
+这一轮固定：
+
+- `max_flag_retrace_ratio = 0.25`
+
+结果：
+
+- `0.08`
+  - `planned_trade_count = 27`
+  - `profit_factor = 1.2881`
+  - `sharpe = 0.1604`
+  - `max_drawdown = 0.89%`
+  - `total_return = 0.58%`
+
+- `0.10`
+  - `planned_trade_count = 36`
+  - `profit_factor = 1.5673`
+  - `sharpe = 0.3188`
+  - `max_drawdown = 1.03%`
+  - `total_return = 1.52%`
+
+- `0.12`
+  - `planned_trade_count = 45`
+  - `profit_factor = 1.9793`
+  - `sharpe = 0.5654`
+  - `max_drawdown = 0.93%`
+  - `total_return = 3.29%`
+
+结论：
+
+- **`flag_width_pct` 不是当前主矛盾。**
+- 这一轮里，越收紧越差。
+- 说明当前窄趋势策略里，`width` 已经不是最该继续压缩的地方。
+- 至少在这条线上，`0.12` 仍然是更合理的默认值。
+
+### Round 3：`flag channel slope`
+
+这一轮固定：
+
+- `max_flag_retrace_ratio = 0.25`
+- `max_flag_width_pct = 0.12`
+- `min_flag_channel_slope_pct_per_bar = -0.008`
+
+只扫上界：
+
+- `upper = 0.0`
+  - `planned_trade_count = 18`
+  - `profit_factor = 3.4235`
+  - `sharpe = 0.6144`
+  - `max_drawdown = 0.41%`
+  - `total_return = 1.64%`
+
+- `upper = 0.004`
+  - `planned_trade_count = 36`
+  - `profit_factor = 1.8043`
+  - `sharpe = 0.4404`
+  - `max_drawdown = 0.94%`
+  - `total_return = 2.15%`
+
+- `upper = 0.008`
+  - `planned_trade_count = 45`
+  - `profit_factor = 1.9793`
+  - `sharpe = 0.5654`
+  - `max_drawdown = 0.93%`
+  - `total_return = 3.29%`
+
+结论：
+
+- 这里没有出现“既提纯又保住收益”的完美点。
+- `upper = 0.0` 的确把质量做得非常高：
+  - `profit_factor` 直接上到 `3.42`
+  - 回撤也最低
+- 但代价是频率和总收益掉得很明显。
+- `upper = 0.008` 反而给了更平衡的结果。
+
+### 综合判断
+
+这三轮串起来看，最清楚的结论是：
+
+1. **真正最值钱的是 `flag_retrace_ratio`**
+   - 这轮明确证明它是当前主提升点
+
+2. **`flag_width_pct` 不是主矛盾**
+   - 不需要继续收
+
+3. **slope 可以提纯，但会明显吃掉频率**
+   - `upper = 0.0` 更像一个高纯度低频版
+   - `upper = 0.008` 更像实战平衡版
+
+如果现在让我从这三轮里先定两个候选：
+
+- 平衡版：
+  - `max_flag_retrace_ratio = 0.25`
+  - `max_flag_width_pct = 0.12`
+  - `min_flag_channel_slope_pct_per_bar = -0.008`
+  - `max_flag_channel_slope_pct_per_bar = 0.008`
+
+- 高纯度版：
+  - `max_flag_retrace_ratio = 0.25`
+  - `max_flag_width_pct = 0.12`
+  - `min_flag_channel_slope_pct_per_bar = -0.008`
+  - `max_flag_channel_slope_pct_per_bar = 0.0`
+
+当前更偏向的判断是：
+
+- 如果你要继续把这条线做成能交易、还能保留一点样本数的版本，
+  - **先用平衡版**
+- 如果你要继续研究“最干净的窄趋势 bull flag 长什么样”，
+  - **高纯度版值得保留作对照**
+
+下一步计划：
+
+- 先不要再动 `flag_width_pct`
+- 如果继续优化，优先顺序会是：
+  1. `max_flag_retrace_ratio` 附近再做一轮细扫（例如 `0.22 / 0.25 / 0.28`）
+  2. breakout bar 质量参数
+  3. 最后再看是否接动态 exit
+
+## 2026-04-23 Round 4：把 slope 上界继续放大（csi1000 narrow trend）
+
+### 本轮做了什么
+
+基于上一轮已经确定的较优 flag 参数，继续只扫一个参数：
+
+- 数据：`Dataframes/csi_1000_stock_price2.csv`
+- 策略：`BullFlagNarrowTrendContinuationResearcher`
+- 固定：
+  - `max_flag_retrace_ratio = 0.25`
+  - `max_flag_width_pct = 0.12`
+  - `min_flag_channel_slope_pct_per_bar = -0.008`
+- 只扫：
+  - `max_flag_channel_slope_pct_per_bar = 0.012 / 0.016 / 0.020`
+
+结果文件：
+
+- `outputs/csi1000_narrow_round4_slope_expand_grid.csv`
+
+### 关键结果
+
+- `upper = 0.012`
+  - `planned_trade_count = 49`
+  - `trade_win_rate = 38.78%`
+  - `average_trade_return = 2.49%`
+  - `profit_factor = 1.5789`
+  - `sharpe = 0.3734`
+  - `max_drawdown = 1.07%`
+  - `total_return = 2.44%`
+
+- `upper = 0.016`
+  - `planned_trade_count = 51`
+  - `trade_win_rate = 41.18%`
+  - `average_trade_return = 4.42%`
+  - `profit_factor = 2.0381`
+  - `sharpe = 0.6290`
+  - `max_drawdown = 0.92%`
+  - `total_return = 4.37%`
+
+- `upper = 0.020`
+  - `planned_trade_count = 51`
+  - `trade_win_rate = 41.18%`
+  - `average_trade_return = 4.42%`
+  - `profit_factor = 2.0381`
+  - `sharpe = 0.6290`
+  - `max_drawdown = 0.92%`
+  - `total_return = 4.37%`
+
+### 结论
+
+这一轮最重要的发现是：
+
+- 对 csi1000 这种小盘环境，**slope 上界并不是越紧越好**。
+- 上一轮我们以为 `0.008` 已经是比较平衡的点，但继续放宽到 `0.016` 之后：
+  - 交易数从 `45` 提到 `51`
+  - `profit_factor` 从 `1.9793` 提到 `2.0381`
+  - `sharpe` 从 `0.5654` 提到 `0.6290`
+  - `total_return` 从 `3.29%` 提到 `4.37%`
+  - `max_drawdown` 还略有下降
+- `0.020` 和 `0.016` 得到完全相同的结果，说明当前样本里真正有影响的 setup，大概已经在 `0.016` 之前全部被放进来了。
+
+这支持一个很符合直觉的判断：
+
+- **小盘股的 bull flag，旗面通道允许的上倾幅度可能确实要比 csi500 更宽一点。**
+- 之前把 slope 压得过紧，可能把一部分“波动更大但仍然有效”的小盘趋势整理误杀了。
+
+### 当前最优平衡候选
+
+截至这一轮，csi1000 narrow trend 这条线里，当前最值得保留的平衡版候选是：
+
+- `max_flag_retrace_ratio = 0.25`
+- `max_flag_width_pct = 0.12`
+- `min_flag_channel_slope_pct_per_bar = -0.008`
+- `max_flag_channel_slope_pct_per_bar = 0.016`
+
+这版对应：
+
+- `planned_trade_count = 51`
+- `profit_factor = 2.0381`
+- `sharpe = 0.6290`
+- `max_drawdown = 0.92%`
+- `total_return = 4.37%`
+
+### 下一步计划
+
+如果继续沿这条线优化，优先级会变成：
+
+1. 先固定新的 slope 平衡点 `0.016`
+2. 在这个基础上，再回头细扫 `max_flag_retrace_ratio`
+3. 最后再看 breakout bar 质量参数和 exit
+
+## 2026-04-23 Round 5：同时放宽 retrace 和负 slope（csi1000 narrow trend）
+
+### 本轮做了什么
+
+这轮不是再单独扫一个参数，而是专门测试一个新的想法：
+
+- 对小盘股来说，旗面可能不仅允许更高一点的正 slope 上界，
+- 也可能允许：
+  - **更深一点的回调**
+  - **更负一点的下倾通道**
+
+所以这轮固定：
+
+- 数据：`Dataframes/csi_1000_stock_price2.csv`
+- 策略：`BullFlagNarrowTrendContinuationResearcher`
+- 固定：
+  - `max_flag_width_pct = 0.12`
+  - `max_flag_channel_slope_pct_per_bar = 0.016`
+
+同时测试：
+
+- `max_flag_retrace_ratio = 0.30 / 0.35`
+- `min_flag_channel_slope_pct_per_bar = -0.012 / -0.016`
+
+结果文件：
+
+- `outputs/csi1000_narrow_round5_retrace_min_slope_grid.csv`
+
+### 关键结果
+
+- `retrace = 0.30`, `min_slope = -0.012`
+  - `planned_trade_count = 76`
+  - `profit_factor = 1.8954`
+  - `sharpe = 0.6295`
+  - `max_drawdown = 1.62%`
+  - `total_return = 5.55%`
+
+- `retrace = 0.30`, `min_slope = -0.016`
+  - `planned_trade_count = 81`
+  - `profit_factor = 1.6091`
+  - `sharpe = 0.4870`
+  - `max_drawdown = 1.62%`
+  - `total_return = 4.45%`
+
+- `retrace = 0.35`, `min_slope = -0.012`
+  - `planned_trade_count = 96`
+  - `profit_factor = 1.6753`
+  - `sharpe = 0.5596`
+  - `max_drawdown = 2.44%`
+  - `total_return = 5.70%`
+
+- `retrace = 0.35`, `min_slope = -0.016`
+  - `planned_trade_count = 101`
+  - `profit_factor = 1.4816`
+  - `sharpe = 0.4401`
+  - `max_drawdown = 2.44%`
+  - `total_return = 4.60%`
+
+### 和当前平衡候选相比
+
+当前上一轮的平衡候选是：
+
+- `max_flag_retrace_ratio = 0.25`
+- `min_flag_channel_slope_pct_per_bar = -0.008`
+- `max_flag_channel_slope_pct_per_bar = 0.016`
+
+它的结果是：
+
+- `planned_trade_count = 51`
+- `profit_factor = 2.0381`
+- `sharpe = 0.6290`
+- `max_drawdown = 0.92%`
+- `total_return = 4.37%`
+
+和它相比，这轮最值得看的组合是：
+
+- `retrace = 0.30`
+- `min_slope = -0.012`
+
+它的特点是：
+
+- 频率明显提高：`51 -> 76`
+- `total_return` 提高：`4.37% -> 5.55%`
+- `sharpe` 基本持平并略高：`0.6290 -> 0.6295`
+- 但 `profit_factor` 下降：`2.0381 -> 1.8954`
+- `max_drawdown` 也上升：`0.92% -> 1.62%`
+
+### 结论
+
+这轮说明：
+
+- **同时放宽 retrace 和更负的 slope，下场不是完全变差。**
+- 对 csi1000 这种小盘环境，这条路确实能带来：
+  - 更多交易
+  - 更高总收益
+- 但代价也很清楚：
+  - 纯度下降
+  - 回撤上升
+
+更具体地说：
+
+- `min_slope` 放到 `-0.016` 基本都不值得
+  - 四个组合里它都明显更差
+- 真正有意思的是：
+  - **`retrace = 0.30` + `min_slope = -0.012`**
+
+所以当前可以保留两种不同取向的候选：
+
+- **高纯度平衡版**
+  - `retrace = 0.25`
+  - `min_slope = -0.008`
+  - `max_slope = 0.016`
+  - 特点：`profit_factor` 更高、回撤更低
+
+- **更进攻的交易版**
+  - `retrace = 0.30`
+  - `min_slope = -0.012`
+  - `max_slope = 0.016`
+  - 特点：频率更高、总收益更高、`sharpe` 仍然不差
+
+### 当前判断
+
+如果目标是：
+
+- **尽量做成一条更像实盘可持续的纯化策略**
+  - 仍然优先保留 `0.25 / -0.008 / 0.016`
+
+- **想在 csi1000 上拿更多机会，同时不明显破坏 `sharpe`**
+  - `0.30 / -0.012 / 0.016` 是目前最值得继续往下挖的一版
+
+## 2026-04-23 Round 6：在更进攻版本上扫 breakout body（csi1000 narrow trend）
+
+### 本轮做了什么
+
+上一轮我们已经找到更进攻的候选：
+
+- `max_flag_retrace_ratio = 0.30`
+- `min_flag_channel_slope_pct_per_bar = -0.012`
+- `max_flag_channel_slope_pct_per_bar = 0.016`
+
+这一轮继续只扫一个参数，专门看 breakout bar 的实体要求：
+
+- 数据：`Dataframes/csi_1000_stock_price2.csv`
+- 策略：`BullFlagNarrowTrendContinuationResearcher`
+- 固定：
+  - `max_flag_retrace_ratio = 0.30`
+  - `max_flag_width_pct = 0.12`
+  - `min_flag_channel_slope_pct_per_bar = -0.012`
+  - `max_flag_channel_slope_pct_per_bar = 0.016`
+- 只扫：
+  - `min_breakout_body_pct = 0.4 / 0.5 / 0.6`
+
+结果文件：
+
+- `outputs/csi1000_narrow_round6_body_grid.csv`
+
+### 关键结果
+
+- `body = 0.4`
+  - `planned_trade_count = 85`
+  - `profit_factor = 1.9885`
+  - `sharpe = 0.6958`
+  - `max_drawdown = 1.32%`
+  - `total_return = 6.45%`
+
+- `body = 0.5`
+  - `planned_trade_count = 84`
+  - `profit_factor = 1.9410`
+  - `sharpe = 0.6644`
+  - `max_drawdown = 1.62%`
+  - `total_return = 6.14%`
+
+- `body = 0.6`
+  - `planned_trade_count = 76`
+  - `profit_factor = 1.8954`
+  - `sharpe = 0.6295`
+  - `max_drawdown = 1.62%`
+  - `total_return = 5.55%`
+
+### 结论
+
+这一轮非常清楚：
+
+- 在 csi1000 这条更进攻的窄趋势版本里，
+  - **signal K 实体要求不是越高越好**
+- 相反，`min_breakout_body_pct = 0.4` 反而给出了最好的平衡：
+  - 频率更高
+  - `profit_factor` 更高
+  - `sharpe` 更高
+  - `max_drawdown` 更低
+  - `total_return` 也最高
+
+这说明：
+
+- 小盘股的 breakout bar 波动更大，
+- 如果把实体门槛压得太高，会把不少“虽然不完美、但后续仍然能走”的信号误杀掉。
+
+### 当前最优进攻候选
+
+截至这一轮，csi1000 narrow trend 这条线里，当前最值得继续往下挖的进攻版更新为：
+
+- `max_flag_retrace_ratio = 0.30`
+- `max_flag_width_pct = 0.12`
+- `min_flag_channel_slope_pct_per_bar = -0.012`
+- `max_flag_channel_slope_pct_per_bar = 0.016`
+- `min_breakout_body_pct = 0.4`
+
+这版对应：
+
+- `planned_trade_count = 85`
+- `profit_factor = 1.9885`
+- `sharpe = 0.6958`
+- `max_drawdown = 1.32%`
+- `total_return = 6.45%`
+
+### 下一步计划
+
+如果继续沿这条进攻版推进，优先级会是：
+
+1. `max_breakout_upper_shadow_pct`
+2. `max_breakout_lower_shadow_pct`
+3. 等 dynamic exit 真正接到窄趋势策略之后，再比较 trailing / structure
+
+## 2026-04-23 Round 7：上影线阈值（csi1000 narrow trend 进攻版）
+
+### 本轮做了什么
+
+在当前进攻版上只扫一个参数：
+
+- 数据：`Dataframes/csi_1000_stock_price2.csv`
+- 策略：`BullFlagNarrowTrendContinuationResearcher`
+- 固定：
+  - `max_flag_retrace_ratio = 0.30`
+  - `max_flag_width_pct = 0.12`
+  - `min_flag_channel_slope_pct_per_bar = -0.012`
+  - `max_flag_channel_slope_pct_per_bar = 0.016`
+  - `min_breakout_body_pct = 0.4`
+- 只扫：
+  - `max_breakout_upper_shadow_pct = 0.25 / 0.35 / 0.45`
+
+结果文件：
+
+- `outputs/csi1000_narrow_round7_upper_shadow_grid.csv`
+
+### 关键结果
+
+- `upper_shadow = 0.25`
+  - `planned_trade_count = 85`
+  - `profit_factor = 1.9885`
+  - `sharpe = 0.6958`
+  - `max_drawdown = 1.32%`
+  - `total_return = 6.45%`
+
+- `upper_shadow = 0.35`
+  - `planned_trade_count = 95`
+  - `profit_factor = 1.7872`
+  - `sharpe = 0.6302`
+  - `max_drawdown = 1.44%`
+  - `total_return = 6.14%`
+
+- `upper_shadow = 0.45`
+  - `planned_trade_count = 100`
+  - `profit_factor = 1.7831`
+  - `sharpe = 0.6488`
+  - `max_drawdown = 1.43%`
+  - `total_return = 6.53%`
+
+### 结论
+
+这轮说明：
+
+- 放宽上影线阈值确实能加频率，
+- 但会明显拉低纯度。
+
+比较起来：
+
+- `0.45` 虽然给出最高交易数和略高一点的总收益，
+- 但 `profit_factor` 和 `sharpe` 都不如 `0.25`，
+- 所以当前更合理的判断是：
+  - **上影线还是要严一点**
+  - `max_breakout_upper_shadow_pct = 0.25` 更像当前 csi1000 进攻版的最佳点
+
+## 2026-04-23 Round 8：下影线阈值（csi1000 narrow trend 进攻版）
+
+### 本轮做了什么
+
+在上一步确定的 `upper_shadow = 0.25` 基础上，再只扫一个参数：
+
+- 固定：
+  - `max_flag_retrace_ratio = 0.30`
+  - `max_flag_width_pct = 0.12`
+  - `min_flag_channel_slope_pct_per_bar = -0.012`
+  - `max_flag_channel_slope_pct_per_bar = 0.016`
+  - `min_breakout_body_pct = 0.4`
+  - `max_breakout_upper_shadow_pct = 0.25`
+- 只扫：
+  - `max_breakout_lower_shadow_pct = 0.35 / 0.50 / 0.65`
+
+结果文件：
+
+- `outputs/csi1000_narrow_round8_lower_shadow_grid.csv`
+
+### 关键结果
+
+- `lower_shadow = 0.35`
+  - `planned_trade_count = 85`
+  - `profit_factor = 1.9885`
+  - `sharpe = 0.6958`
+  - `max_drawdown = 1.32%`
+  - `total_return = 6.45%`
+
+- `lower_shadow = 0.50`
+  - `planned_trade_count = 92`
+  - `profit_factor = 2.0279`
+  - `sharpe = 0.7106`
+  - `max_drawdown = 1.31%`
+  - `total_return = 7.09%`
+
+- `lower_shadow = 0.65`
+  - `planned_trade_count = 92`
+  - `profit_factor = 2.0279`
+  - `sharpe = 0.7106`
+  - `max_drawdown = 1.31%`
+  - `total_return = 7.09%`
+
+### 结论
+
+这轮和上影线正好相反：
+
+- **下影线并不需要太严**
+- 从 `0.35` 放宽到 `0.50` 之后：
+  - 交易数提高
+  - `profit_factor` 提高
+  - `sharpe` 提高
+  - `max_drawdown` 还略有改善
+  - `total_return` 明显提高
+- `0.65` 和 `0.50` 完全一样，说明当前样本里真正有用的信号已经在 `0.50` 时全部放进来了
+
+### 当前最优进攻候选（更新）
+
+截至目前，csi1000 narrow trend 这条线里，当前最值得继续推进的进攻版更新为：
+
+- `max_flag_retrace_ratio = 0.30`
+- `max_flag_width_pct = 0.12`
+- `min_flag_channel_slope_pct_per_bar = -0.012`
+- `max_flag_channel_slope_pct_per_bar = 0.016`
+- `min_breakout_body_pct = 0.4`
+- `max_breakout_upper_shadow_pct = 0.25`
+- `max_breakout_lower_shadow_pct = 0.50`
+
+这版对应：
+
+- `planned_trade_count = 92`
+- `profit_factor = 2.0279`
+- `sharpe = 0.7106`
+- `max_drawdown = 1.31%`
+- `total_return = 7.09%`
+
+### 当前判断
+
+这两轮把 signal K 这块的认识补完整了：
+
+- **实体不需要太苛刻**：`0.4` 最好
+- **上影线要严**：`0.25` 最好
+- **下影线可以松**：`0.50` 最好
+
+这很符合一个更像小盘股的 breakout 画像：
+
+- 可以允许盘中有一定回踩，
+- 但不能接受明显的冲高回落。
+
+## 2026-04-24 Round 9：扫 `narrow_trend_lookback_bars = 10 / 15 / 30`
+
+### 本轮做了什么
+
+在当前最优进攻候选上，只扫左侧窄趋势状态机的窗口长度 `N`：
+
+- 数据：`Dataframes/csi_1000_stock_price2.csv`
+- 策略：`BullFlagNarrowTrendContinuationResearcher`
+- 固定：
+  - `max_flag_retrace_ratio = 0.30`
+  - `max_flag_width_pct = 0.12`
+  - `min_flag_channel_slope_pct_per_bar = -0.012`
+  - `max_flag_channel_slope_pct_per_bar = 0.016`
+  - `min_breakout_body_pct = 0.4`
+  - `max_breakout_upper_shadow_pct = 0.25`
+  - `max_breakout_lower_shadow_pct = 0.50`
+- 只扫：
+  - `narrow_trend_lookback_bars = 10 / 15 / 30`
+
+结果文件：
+
+- `outputs/csi1000_narrow_round9_lookback_grid.csv`
+
+### 关键结果
+
+- `N = 10`
+  - `planned_trade_count = 441`
+  - `profit_factor = 1.2831`
+  - `sharpe = 0.4059`
+  - `max_drawdown = 6.18%`
+  - `total_return = 10.98%`
+
+- `N = 15`
+  - `planned_trade_count = 130`
+  - `profit_factor = 1.9506`
+  - `sharpe = 0.8499`
+  - `max_drawdown = 1.86%`
+  - `total_return = 9.69%`
+
+- `N = 30`
+  - `planned_trade_count = 11`
+  - `profit_factor = 1.8099`
+  - `sharpe = 0.2246`
+  - `max_drawdown = 0.49%`
+  - `total_return = 0.55%`
+
+### 结论
+
+这一轮非常清楚：
+
+- `N = 10` 太短了
+  - 会把大量局部加速段都识别成窄趋势
+  - 频率直接爆发，但纯度明显下降
+  - 回撤也被拉大
+
+- `N = 30` 太长了
+  - 会把窄趋势定义得过于严格
+  - 样本几乎被杀光
+  - 虽然回撤很低，但策略已经太稀了
+
+- `N = 15` 是当前最像平衡点的
+  - 交易数仍然足够
+  - `profit_factor`、`sharpe`、回撤控制都明显优于 `N = 10`
+  - 总收益也仍然很高
+
+### 当前最优进攻候选（更新）
+
+截至目前，csi1000 narrow trend 这条线里，当前最值得继续推进的进攻版更新为：
+
+- `narrow_trend_lookback_bars = 15`
+- `max_flag_retrace_ratio = 0.30`
+- `max_flag_width_pct = 0.12`
+- `min_flag_channel_slope_pct_per_bar = -0.012`
+- `max_flag_channel_slope_pct_per_bar = 0.016`
+- `min_breakout_body_pct = 0.4`
+- `max_breakout_upper_shadow_pct = 0.25`
+- `max_breakout_lower_shadow_pct = 0.50`
+
+这版对应：
+
+- `planned_trade_count = 130`
+- `profit_factor = 1.9506`
+- `sharpe = 0.8499`
+- `max_drawdown = 1.86%`
+- `total_return = 9.69%`
+
+### 当前判断
+
+到这一步，左侧窄趋势状态机这块已经很清楚了：
+
+- 太短的 `N` 会把太多局部加速误认成“干净趋势”
+- 太长的 `N` 会把样本压得太狠
+- **`N = 15` 在 csi1000 这条线上，目前是最合理的 compromise**
+
+## 2026-04-24 Round 10：`N = 10~20` 细网格（csi1000 narrow trend）
+
+### 本轮做了什么
+
+在当前最优进攻候选上，把 `narrow_trend_lookback_bars` 做了一轮更细的扫描：
+
+- 数据：`Dataframes/csi_1000_stock_price2.csv`
+- 策略：`BullFlagNarrowTrendContinuationResearcher`
+- 固定：
+  - `max_flag_retrace_ratio = 0.30`
+  - `max_flag_width_pct = 0.12`
+  - `min_flag_channel_slope_pct_per_bar = -0.012`
+  - `max_flag_channel_slope_pct_per_bar = 0.016`
+  - `min_breakout_body_pct = 0.4`
+  - `max_breakout_upper_shadow_pct = 0.25`
+  - `max_breakout_lower_shadow_pct = 0.50`
+- 只扫：
+  - `narrow_trend_lookback_bars = 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20`
+
+结果文件：
+
+- `outputs/csi1000_narrow_round10_lookback_fine_grid.csv`
+
+### 关键结果
+
+- `N = 10`
+  - `planned_trade_count = 441`
+  - `profit_factor = 1.2831`
+  - `sharpe = 0.4059`
+  - `max_drawdown = 6.18%`
+  - `total_return = 10.98%`
+
+- `N = 11`
+  - `planned_trade_count = 286`
+  - `profit_factor = 1.4368`
+  - `sharpe = 0.5712`
+  - `max_drawdown = 4.42%`
+  - `total_return = 10.78%`
+
+- `N = 12`
+  - `planned_trade_count = 446`
+  - `profit_factor = 1.2985`
+  - `sharpe = 0.4443`
+  - `max_drawdown = 5.21%`
+  - `total_return = 11.86%`
+
+- `N = 13`
+  - `planned_trade_count = 298`
+  - `profit_factor = 1.2043`
+  - `sharpe = 0.3161`
+  - `max_drawdown = 4.55%`
+  - `total_return = 5.78%`
+
+- `N = 14`
+  - `planned_trade_count = 204`
+  - `profit_factor = 1.5206`
+  - `sharpe = 0.6426`
+  - `max_drawdown = 2.86%`
+  - `total_return = 9.25%`
+
+- `N = 15`
+  - `planned_trade_count = 130`
+  - `profit_factor = 1.9506`
+  - `sharpe = 0.8499`
+  - `max_drawdown = 1.86%`
+  - `total_return = 9.69%`
+
+- `N = 16`
+  - `planned_trade_count = 203`
+  - `profit_factor = 1.7814`
+  - `sharpe = 0.8173`
+  - `max_drawdown = 2.80%`
+  - `total_return = 13.05%`
+
+- `N = 17`
+  - `planned_trade_count = 133`
+  - `profit_factor = 2.1593`
+  - `sharpe = 0.9257`
+  - `max_drawdown = 1.71%`
+  - `total_return = 11.50%`
+
+- `N = 18`
+  - `planned_trade_count = 87`
+  - `profit_factor = 2.3491`
+  - `sharpe = 0.8672`
+  - `max_drawdown = 1.41%`
+  - `total_return = 8.53%`
+
+- `N = 19`
+  - `planned_trade_count = 61`
+  - `profit_factor = 2.7685`
+  - `sharpe = 0.9149`
+  - `max_drawdown = 1.13%`
+  - `total_return = 7.34%`
+
+- `N = 20`
+  - `planned_trade_count = 92`
+  - `profit_factor = 2.0279`
+  - `sharpe = 0.7106`
+  - `max_drawdown = 1.31%`
+  - `total_return = 7.09%`
+
+### 结论
+
+这一轮最重要的发现是：
+
+- `N` 对这条策略的影响**非常非线性**，
+- 并不是简单的“越短越差、越长越好”或反过来。
+
+更准确地说，当前出现了几种不同取向的局部最优：
+
+1. **高频高收益但更脏**
+   - `N = 10 / 12`
+   - 交易数和总收益都很高
+   - 但 `profit_factor`、`sharpe` 和回撤控制都明显差
+
+2. **平衡型**
+   - `N = 15 / 16 / 17`
+   - 交易数还够
+   - `profit_factor` 和 `sharpe` 明显更好
+   - 其中 `N = 17` 的综合表现最突出
+
+3. **高纯度低频型**
+   - `N = 18 / 19`
+   - `profit_factor` 和回撤非常漂亮
+   - 但频率和总收益会继续下降
+
+### 当前最值得保留的几个候选
+
+如果按不同目标来选：
+
+- **综合最优 / 当前主推**
+  - `N = 17`
+  - `planned_trade_count = 133`
+  - `profit_factor = 2.1593`
+  - `sharpe = 0.9257`
+  - `max_drawdown = 1.71%`
+  - `total_return = 11.50%`
+
+- **最高总收益版**
+  - `N = 16`
+  - `total_return = 13.05%`
+  - 但 `profit_factor` 和回撤不如 `N = 17`
+
+- **最高纯度版**
+  - `N = 19`
+  - `profit_factor = 2.7685`
+  - `max_drawdown = 1.13%`
+  - 但频率只有 `61` 笔
+
+### 当前判断
+
+所以到这一步，我会把当前这条 csi1000 narrow trend 主线的默认候选，从 `N = 15` 更新为：
+
+- **`N = 17`**
+
+因为它比 `N = 15`：
+
+- `profit_factor` 更高
+- `sharpe` 更高
+- `total_return` 更高
+- 回撤还更低
+
+这是目前最像“频率、质量、收益”三者都比较平衡的点。
+
+## 2026-04-24 验证框架：时间切分 + 滚动窗口 + 邻域扰动
+
+### 验证对象
+
+先锁定当前主推参数做 out-of-sample 验证：
+
+- `narrow_trend_lookback_bars = 17`
+- `max_flag_retrace_ratio = 0.30`
+- `max_flag_width_pct = 0.12`
+- `min_flag_channel_slope_pct_per_bar = -0.012`
+- `max_flag_channel_slope_pct_per_bar = 0.016`
+- `min_breakout_body_pct = 0.4`
+- `max_breakout_upper_shadow_pct = 0.25`
+- `max_breakout_lower_shadow_pct = 0.50`
+
+数据：
+
+- `Dataframes/csi_1000_stock_price2.csv`
+
+输出文件：
+
+- `outputs/csi1000_narrow_validation_time_splits.csv`
+- `outputs/csi1000_narrow_validation_rolling_windows.csv`
+- `outputs/csi1000_narrow_validation_n_neighbors.csv`
+- `outputs/csi1000_narrow_validation_retrace_neighbors.csv`
+
+### 1. 时间切分验证
+
+切分方式：
+
+- `train = 2015-01-05 ~ 2022-12-30`
+- `validation = 2023-01-03 ~ 2024-12-31`
+- `test = 2025-01-02 ~ 2026-04-21`
+
+结果：
+
+- `train`
+  - `planned_trade_count = 97`
+  - `profit_factor = 2.5662`
+  - `sharpe = 1.1520`
+  - `max_drawdown = 1.71%`
+  - `total_return = 11.09%`
+
+- `validation`
+  - `planned_trade_count = 20`
+  - `profit_factor = 0.7191`
+  - `sharpe = -0.2607`
+  - `max_drawdown = 1.59%`
+  - `total_return = -0.48%`
+
+- `test`
+  - `planned_trade_count = 16`
+  - `profit_factor = 1.7817`
+  - `sharpe = 0.9530`
+  - `max_drawdown = 0.64%`
+  - `total_return = 0.90%`
+
+### 2. 滚动窗口稳定性
+
+结果：
+
+- `2015-2017`
+  - `profit_factor = 5.2041`
+  - `sharpe = 1.7109`
+
+- `2018-2020`
+  - `profit_factor = 1.3968`
+  - `sharpe = 0.4534`
+
+- `2021-2023`
+  - `profit_factor = 2.2086`
+  - `sharpe = 0.8889`
+
+- `2024-2026`
+  - `profit_factor = 1.1493`
+  - `sharpe = 0.1675`
+
+### 3. 邻域扰动：`N = 16 / 17 / 18`
+
+结果：
+
+- `N = 16`
+  - `validation`
+    - `profit_factor = 0.7134`
+    - `sharpe = -0.4153`
+    - `total_return = -1.06%`
+  - `test`
+    - `profit_factor = 1.9601`
+    - `sharpe = 1.1978`
+    - `total_return = 1.37%`
+
+- `N = 17`
+  - `validation`
+    - `profit_factor = 0.7191`
+    - `sharpe = -0.2607`
+    - `total_return = -0.48%`
+  - `test`
+    - `profit_factor = 1.7817`
+    - `sharpe = 0.9530`
+    - `total_return = 0.90%`
+
+- `N = 18`
+  - `validation`
+    - `profit_factor = 0.1689`
+    - `sharpe = -0.5990`
+    - `total_return = -0.90%`
+  - `test`
+    - `profit_factor = 1.6180`
+    - `sharpe = 0.5762`
+    - `total_return = 0.52%`
+
+### 4. 邻域扰动：`retrace = 0.28 / 0.30 / 0.32`
+
+结果：
+
+- `retrace = 0.28`
+  - `validation`
+    - `profit_factor = 0.6242`
+    - `sharpe = -0.3542`
+    - `total_return = -0.64%`
+  - `test`
+    - `profit_factor = 1.5053`
+    - `sharpe = 0.6016`
+    - `total_return = 0.52%`
+
+- `retrace = 0.30`
+  - `validation`
+    - `profit_factor = 0.7191`
+    - `sharpe = -0.2607`
+    - `total_return = -0.48%`
+  - `test`
+    - `profit_factor = 1.7817`
+    - `sharpe = 0.9530`
+    - `total_return = 0.90%`
+
+- `retrace = 0.32`
+  - `validation`
+    - `profit_factor = 0.7702`
+    - `sharpe = -0.2310`
+    - `total_return = -0.45%`
+  - `test`
+    - `profit_factor = 1.5127`
+    - `sharpe = 0.6856`
+    - `total_return = 0.69%`
+
+### 综合结论
+
+这套验证框架给出的判断非常清楚：
+
+1. **有 overfit 风险，但不是“完全失真”的那种**
+   - 因为 test 段依然是正的，而且 `profit_factor`、`sharpe` 都不差
+
+2. **真正的问题是 regime dependence 很强**
+   - `2023-2024` 这一段明显不适合这条策略
+   - 而 `2025-2026` 又重新恢复
+
+3. **当前参数不是单点尖峰**
+   - `N = 16 / 17`
+   - `retrace = 0.30 / 0.32`
+   周围都有一定可行性
+   - 这说明虽然有调参，但不是那种“一碰就碎”的极端点
+
+4. **当前主推参数仍然可以保留**
+   - 因为它在 full-history、test 段和邻域稳定性上都还算站得住
+   - 但不能把它理解成“任何市场阶段都稳定赚钱”
+
+### 当前判断
+
+所以到这一步，我会把这条 csi1000 narrow trend 策略的状态定义为：
+
+- **已形成可交易候选**
+- **但具有明显市场阶段依赖**
+
+下一步真正值得做的，不再是继续盲调 entry 参数，而是：
+
+1. 加一个市场环境 / 情绪过滤
+2. 或把这条策略限定在它更擅长的 regime 下使用
+
+## 2026-04-23 当前最优平衡候选的漏斗（csi1000 narrow trend）
+
+### 漏斗口径
+
+当前漏斗使用的是这一版平衡候选：
+
+- `narrow_trend_lookback_bars = 20`
+- `narrow_trend_max_bear_ratio = 0.25`
+- `narrow_trend_min_run_bars = 1`
+- `max_flag_retrace_ratio = 0.25`
+- `max_flag_width_pct = 0.12`
+- `min_flag_channel_slope_pct_per_bar = -0.008`
+- `max_flag_channel_slope_pct_per_bar = 0.016`
+
+数据：
+
+- `Dataframes/csi_1000_stock_price2.csv`
+
+这里同时看两层：
+
+- **run 级漏斗**：每段连续 `narrow_uptrend_state=True` 只取最后一根
+- **row 级漏斗**：所有 candle 级别的信号统计
+
+### run 级漏斗
+
+- `run_end_events = 4350`
+- `run_with_structured_row = 2764`
+- `run_with_candidate_row = 457`
+- `run_with_breakout_row = 138`
+- `run_with_follow_through_row = 111`
+- `run_with_entry_row = 53`
+- `executed_trades = 51`
+
+对应保留率：
+
+- `run_end -> structured = 63.54%`
+- `structured -> candidate = 16.53%`
+- `candidate -> breakout = 30.20%`
+- `breakout -> follow_through = 80.43%`
+- `follow_through -> entry = 47.75%`
+- `entry -> executed = 96.23%`
+
+### row 级漏斗
+
+- `structured_rows = 27238`
+- `bull_flag_candidate = 1726`
+- `breakout_candle = 174`
+- `signal_candle = 174`
+- `follow_through_confirmed = 133`
+- `entry_signal = 55`
+- `entry_signal_executed = 51`
+
+### 结论
+
+这一版最新平衡候选的漏斗已经比前面的旧版本清晰很多，主要问题集中在两层：
+
+1. **`structured -> candidate`**
+   - `2764 -> 457`
+   - 这说明当前最主要的掉点，依然在 flag 本体本身：
+     - `flag_retrace_ratio`
+     - `flag_width_pct`
+     - `flag channel slope`
+
+2. **`follow_through -> entry`**
+   - `111 -> 53`
+   - 这层依然几乎是被 `reward_to_risk` 过滤掉的
+
+具体看 row 级 follow-through：
+
+- `follow_through_rows = 133`
+- `reward_to_risk_ok_true = 55`
+- `reward_to_risk_ok_false = 78`
+- `trend_environment_ok_true = 133`
+- `trend_environment_ok_false = 0`
+
+这说明：
+
+- 现在不是趋势环境在卡掉 follow-through
+- 也不是次日无法成交
+- **核心还是赔率不够**
+
+### 当前判断
+
+所以到这一步，当前 csi1000 narrow trend 这条线最该继续优化的地方，顺序会是：
+
+1. `flag_retrace_ratio`
+2. `flag channel slope`
+3. breakout / follow-through 后的赔率结构
+
+而不是再回头去怀疑 left trend 的 `narrow_state` 频率本身。

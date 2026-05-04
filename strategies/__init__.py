@@ -24,6 +24,26 @@ from .china_stock_data import (
     get_hs300_member_prices,
 )
 from .gap_breakout_continuation import GapBreakoutContinuationResearcher, GapBreakoutStrategyConfig
+from .sector_rotation import (
+    DEFAULT_BOARD_TYPES,
+    SectorRotationConfig,
+    fetch_sector_board_changes,
+    fetch_sector_board_snapshot,
+    fetch_sector_constituents,
+    format_sector_rotation_report,
+    scan_hot_sectors,
+    score_sector_heat,
+    score_sector_leaders,
+)
+from .etf_rotation import (
+    DEFAULT_ETF_UNIVERSE,
+    ETFHeatRotationConfig,
+    ETFHeatRotationScorer,
+    ETFUniverseMember,
+    build_rotation_membership_frame,
+    fetch_etf_price_panel,
+    fetch_single_etf_price_history,
+)
 from .trend_pullback_continuation import TrendPullbackContinuationResearcher, TrendPullbackStrategyConfig
 
 __all__ = [
@@ -50,6 +70,22 @@ __all__ = [
     "get_all_a_share_member_prices",
     "GapBreakoutContinuationResearcher",
     "GapBreakoutStrategyConfig",
+    "DEFAULT_BOARD_TYPES",
+    "SectorRotationConfig",
+    "fetch_sector_board_changes",
+    "fetch_sector_board_snapshot",
+    "fetch_sector_constituents",
+    "format_sector_rotation_report",
+    "scan_hot_sectors",
+    "score_sector_heat",
+    "score_sector_leaders",
+    "DEFAULT_ETF_UNIVERSE",
+    "ETFHeatRotationConfig",
+    "ETFHeatRotationScorer",
+    "ETFUniverseMember",
+    "build_rotation_membership_frame",
+    "fetch_etf_price_panel",
+    "fetch_single_etf_price_history",
     "TrendPullbackContinuationResearcher",
     "TrendPullbackStrategyConfig",
 ]

@@ -60,8 +60,7 @@ def _get_tushare_client(token: str | None = None):
         raise ValueError(
             "Tushare token is required. Pass token=... or set TUSHARE_TOKEN."
         )
-    ts.set_token(resolved_token)
-    return ts.pro_api()
+    return ts.pro_api(token=resolved_token)
 
 
 def _index_metadata(index_code: str) -> dict[str, str]:

@@ -102,3 +102,4 @@ Dataframes/
 
 # CSV
 *.csv
+*.pkl

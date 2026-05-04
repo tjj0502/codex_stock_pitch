@@ -121,6 +121,35 @@ class FakeNarrowTrendResearcher:
             }
         )
 
+    def monitor_positions(
+        self,
+        positions_df: pd.DataFrame,
+        as_of_date=None,
+        *,
+        next_trade_date=None,
+    ) -> pd.DataFrame:
+        if positions_df.empty:
+            return pd.DataFrame()
+        monitored = positions_df.copy()
+        monitored["as_of_date"] = pd.Timestamp(as_of_date)
+        monitored["latest_bar_date"] = pd.Timestamp(as_of_date)
+        monitored["current_close"] = 11.5
+        monitored["pnl_pct"] = 0.05
+        monitored["pnl_amount"] = 50.0
+        monitored["holding_days"] = 3
+        monitored["trading_days_in_trade"] = 3
+        monitored["days_until_time_stop"] = 7
+        monitored["hard_stop_price"] = 10.8
+        monitored["take_profit_price"] = 12.8
+        monitored["reward_to_risk"] = 1.8
+        monitored["exit_signal"] = True
+        monitored["exit_signal_date"] = pd.Timestamp(as_of_date)
+        monitored["planned_exit_date"] = pd.Timestamp(next_trade_date)
+        monitored["exit_reason"] = "hard_stop"
+        monitored["action"] = "prepare_exit"
+        monitored["issue"] = pd.NA
+        return monitored
+
 
 class DailyNarrowTrendScanTests(unittest.TestCase):
     def test_compute_narrow_trend_just_ended_detects_transitions(self) -> None:
@@ -201,6 +230,18 @@ class DailyNarrowTrendScanTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             output_root = temp_path / "outputs"
+            positions_path = temp_path / "open_positions.csv"
+            pd.DataFrame(
+                {
+                    "universe": ["hs300", "csi500", "csi1000"],
+                    "ticker": ["HS300A", "CSI500A", "CSI1000A"],
+                    "entry_date": pd.to_datetime(["2026-04-20", "2026-04-20", "2026-04-20"]),
+                    "entry_price": [10.0, 10.0, 10.0],
+                    "shares": [100, 100, 100],
+                    "signal_date": pd.to_datetime(["2026-04-18", "2026-04-18", "2026-04-18"]),
+                    "note": ["", "", ""],
+                }
+            ).to_csv(positions_path, index=False)
 
             def fake_fetcher(*, sd, ed, token=None, pause_seconds=1.3, max_calls_per_minute=195):
                 return make_price_frame("AAA", ["2026-04-23", "2026-04-24"])
@@ -220,6 +261,7 @@ class DailyNarrowTrendScanTests(unittest.TestCase):
                     end_date="2026-04-24",
                     universe_specs=specs,
                     output_root=output_root,
+                    positions_path=positions_path,
                     researcher_cls=FakeNarrowTrendResearcher,
                 )
 
@@ -229,16 +271,20 @@ class DailyNarrowTrendScanTests(unittest.TestCase):
             for universe in ("hs300", "csi500", "csi1000"):
                 self.assertTrue((daily_output_dir / f"{universe}_candidates_20260424.csv").exists())
                 self.assertTrue((daily_output_dir / f"{universe}_narrow_trend_just_ended_20260424.csv").exists())
+                self.assertTrue((daily_output_dir / f"{universe}_exits_20260424.csv").exists())
 
             summary_df = pd.read_csv(daily_output_dir / "daily_scan_summary_20260424.csv")
             self.assertEqual(sorted(summary_df["universe"].tolist()), ["csi1000", "csi500", "hs300"])
             self.assertTrue((summary_df["candidate_count"] == 1).all())
             self.assertTrue((summary_df["just_ended_count"] == 1).all())
+            self.assertTrue((summary_df["exit_count"] == 1).all())
 
             report = format_scan_report(results)
             self.assertIn("[hs300]", report)
             self.assertIn("- candidate_count: 1", report)
             self.assertIn("- just_ended_count: 1", report)
+            self.assertIn("- exit_count: 1", report)
+            self.assertIn("- exits: HS300A", report)
 
 
 if __name__ == "__main__":

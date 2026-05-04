@@ -21,6 +21,7 @@ from strategies.china_stock_data import PRICE_COLUMNS, get_next_trading_day
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DATAFRAME_DIR = REPO_ROOT / "Dataframes"
 OUTPUT_ROOT = REPO_ROOT / "strategy_archive" / "bull_flag_narrow_trend_continuation" / "outputs"
+POSITIONS_PATH = REPO_ROOT / "strategy_archive" / "bull_flag_narrow_trend_continuation" / "open_positions.csv"
 
 DEFAULT_LOOKBACK_CALENDAR_DAYS = 420
 DEFAULT_UNIVERSES = ("hs300", "csi500", "csi1000")
@@ -66,6 +67,33 @@ JUST_ENDED_COLUMNS = [
     "previous_peak_upper_shadow_pct",
     "close",
 ]
+EXIT_COLUMNS = [
+    "ticker",
+    "ts_code",
+    "name",
+    "entry_date",
+    "entry_price",
+    "shares",
+    "signal_date",
+    "note",
+    "as_of_date",
+    "latest_bar_date",
+    "current_close",
+    "pnl_pct",
+    "pnl_amount",
+    "holding_days",
+    "trading_days_in_trade",
+    "days_until_time_stop",
+    "hard_stop_price",
+    "take_profit_price",
+    "reward_to_risk",
+    "exit_signal",
+    "exit_signal_date",
+    "planned_exit_date",
+    "exit_reason",
+    "action",
+    "issue",
+]
 
 
 def build_narrow_trend_config(universe: str) -> BullFlagNarrowTrendStrategyConfig:
@@ -110,6 +138,47 @@ def _read_price_csv(path: Path) -> pd.DataFrame:
     if not path.exists():
         return _empty_price_frame()
     return _coerce_price_frame(pd.read_csv(path))
+
+
+def _read_positions_csv(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame()
+    positions = pd.read_csv(path)
+    if positions.empty:
+        return positions
+    if "ticker" in positions.columns:
+        positions["ticker"] = positions["ticker"].astype("string")
+    if "universe" in positions.columns:
+        positions["universe"] = positions["universe"].astype("string").str.lower()
+    for column in ("entry_date", "signal_date"):
+        if column in positions.columns:
+            positions[column] = pd.to_datetime(positions[column], errors="coerce")
+    for column in ("entry_price", "shares"):
+        if column in positions.columns:
+            positions[column] = pd.to_numeric(positions[column], errors="coerce")
+    return positions
+
+
+def _select_positions_for_universe(
+    positions_df: pd.DataFrame | None,
+    *,
+    universe: str,
+    price_df: pd.DataFrame,
+) -> pd.DataFrame:
+    if positions_df is None or positions_df.empty:
+        return pd.DataFrame()
+
+    positions = positions_df.copy()
+    if "universe" in positions.columns:
+        filtered = positions[positions["universe"].fillna("").astype(str).str.lower().eq(universe)].copy()
+        return filtered.reset_index(drop=True)
+
+    if price_df.empty or "ticker" not in positions.columns:
+        return pd.DataFrame(columns=positions.columns)
+
+    universe_tickers = set(price_df["ticker"].astype(str))
+    filtered = positions[positions["ticker"].astype(str).isin(universe_tickers)].copy()
+    return filtered.reset_index(drop=True)
 
 
 def _filter_window(df: pd.DataFrame, window_start: pd.Timestamp, end_date: pd.Timestamp) -> pd.DataFrame:
@@ -224,6 +293,7 @@ def scan_universe(
     token: str | None = None,
     pause_seconds: float = DEFAULT_PAUSE_SECONDS,
     max_calls_per_minute: int = 195,
+    positions_df: pd.DataFrame | None = None,
     researcher_cls: type[BullFlagNarrowTrendContinuationResearcher] = BullFlagNarrowTrendContinuationResearcher,
 ) -> dict[str, object]:
     price_df, cache_meta = update_universe_cache(
@@ -258,15 +328,35 @@ def scan_universe(
         entry_price_basis="follow_through_close",
     )
     just_ended = compute_narrow_trend_just_ended(scored_df, as_of_date)
+    positions_for_universe = _select_positions_for_universe(positions_df, universe=spec.universe, price_df=price_df)
+    monitored_positions = (
+        researcher.monitor_positions(
+            positions_for_universe,
+            as_of_date=as_of_date,
+            next_trade_date=next_trade_date,
+        )
+        if not positions_for_universe.empty
+        else pd.DataFrame(columns=EXIT_COLUMNS)
+    )
+    exits = (
+        monitored_positions[monitored_positions["action"].astype(str).eq("prepare_exit")].copy()
+        if not monitored_positions.empty and "action" in monitored_positions.columns
+        else pd.DataFrame(columns=EXIT_COLUMNS)
+    )
+    if not exits.empty:
+        exits = exits.reindex(columns=list(dict.fromkeys([*EXIT_COLUMNS, *exits.columns])), fill_value=pd.NA)
     return {
         **cache_meta,
         "next_trade_date": next_trade_date,
         "candidates": candidates,
         "just_ended": just_ended,
+        "exits": exits,
         "candidate_count": int(len(candidates)),
         "just_ended_count": int(len(just_ended)),
+        "exit_count": int(len(exits)),
         "candidate_tickers": candidates["ticker"].astype(str).tolist() if not candidates.empty else [],
         "just_ended_tickers": just_ended["ticker"].astype(str).tolist() if not just_ended.empty else [],
+        "exit_tickers": exits["ticker"].astype(str).tolist() if not exits.empty else [],
         "status": "ok",
         "error": "",
     }
@@ -280,15 +370,18 @@ def run_daily_scan(
     token: str | None = None,
     pause_seconds: float = DEFAULT_PAUSE_SECONDS,
     max_calls_per_minute: int = 195,
+    positions_path: Path | None = None,
     universe_specs: dict[str, UniverseScanSpec] | None = None,
     output_root: Path | None = None,
     researcher_cls: type[BullFlagNarrowTrendContinuationResearcher] = BullFlagNarrowTrendContinuationResearcher,
 ) -> list[dict[str, object]]:
     specs = universe_specs or UNIVERSE_SPECS
     output_base = output_root or OUTPUT_ROOT
+    resolved_positions_path = positions_path or POSITIONS_PATH
     scan_date = pd.Timestamp(end_date or pd.Timestamp.today()).normalize()
     daily_output_dir = output_base / scan_date.strftime("%Y-%m-%d")
     daily_output_dir.mkdir(parents=True, exist_ok=True)
+    positions_df = _read_positions_csv(resolved_positions_path)
 
     results: list[dict[str, object]] = []
     summary_rows: list[dict[str, object]] = []
@@ -302,6 +395,7 @@ def run_daily_scan(
                 token=token,
                 pause_seconds=pause_seconds,
                 max_calls_per_minute=max_calls_per_minute,
+                positions_df=positions_df,
                 researcher_cls=researcher_cls,
             )
         except Exception as exc:
@@ -318,22 +412,29 @@ def run_daily_scan(
                 "next_trade_date": pd.NaT,
                 "candidates": pd.DataFrame(),
                 "just_ended": pd.DataFrame(columns=JUST_ENDED_COLUMNS),
+                "exits": pd.DataFrame(columns=EXIT_COLUMNS),
                 "candidate_count": 0,
                 "just_ended_count": 0,
+                "exit_count": 0,
                 "candidate_tickers": [],
                 "just_ended_tickers": [],
+                "exit_tickers": [],
                 "status": "error",
                 "error": str(exc),
             }
 
         candidates_path = daily_output_dir / f"{universe}_candidates_{scan_date:%Y%m%d}.csv"
         just_ended_path = daily_output_dir / f"{universe}_narrow_trend_just_ended_{scan_date:%Y%m%d}.csv"
+        exits_path = daily_output_dir / f"{universe}_exits_{scan_date:%Y%m%d}.csv"
         candidates_df = result["candidates"]
         just_ended_df = result["just_ended"]
+        exits_df = result["exits"]
         if isinstance(candidates_df, pd.DataFrame):
             candidates_df.to_csv(candidates_path, index=False)
         if isinstance(just_ended_df, pd.DataFrame):
             just_ended_df.to_csv(just_ended_path, index=False)
+        if isinstance(exits_df, pd.DataFrame):
+            exits_df.to_csv(exits_path, index=False)
 
         summary_rows.append(
             {
@@ -350,10 +451,13 @@ def run_daily_scan(
                 "next_trade_date": result["next_trade_date"],
                 "candidate_count": result["candidate_count"],
                 "just_ended_count": result["just_ended_count"],
+                "exit_count": result["exit_count"],
                 "candidate_tickers": "|".join(result["candidate_tickers"]),
                 "just_ended_tickers": "|".join(result["just_ended_tickers"]),
+                "exit_tickers": "|".join(result["exit_tickers"]),
                 "candidates_path": str(candidates_path),
                 "just_ended_path": str(just_ended_path),
+                "exits_path": str(exits_path),
             }
         )
         results.append(result)
@@ -384,10 +488,13 @@ def format_scan_report(results: list[dict[str, object]]) -> str:
         )
         lines.append(f"- candidate_count: {result['candidate_count']}")
         lines.append(f"- just_ended_count: {result['just_ended_count']}")
+        lines.append(f"- exit_count: {result['exit_count']}")
         candidate_text = ", ".join(result["candidate_tickers"]) if result["candidate_tickers"] else "0"
         just_ended_text = ", ".join(result["just_ended_tickers"]) if result["just_ended_tickers"] else "0"
+        exit_text = ", ".join(result["exit_tickers"]) if result["exit_tickers"] else "0"
         lines.append(f"- candidates: {candidate_text}")
         lines.append(f"- narrow_trend_just_ended: {just_ended_text}")
+        lines.append(f"- exits: {exit_text}")
         lines.append("")
     return "\n".join(lines).rstrip()
 
